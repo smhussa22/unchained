@@ -42,7 +42,8 @@
         {
           "microphonePermission": "Speak Vision needs microphone access for voice conversations with AI."
         }
-      ]
+      ],
+      "expo-font"
     ]
   }
 }

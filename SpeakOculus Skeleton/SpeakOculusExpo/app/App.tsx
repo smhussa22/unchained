@@ -2,30 +2,37 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   StyleSheet,
   View,
-  TouchableOpacity,
   StatusBar,
   Platform,
   PermissionsAndroid,
   Text,
+  Dimensions,
 } from 'react-native';
 import { Audio } from 'expo-av';
 import AudioRecord from 'react-native-audio-record';
 import { Buffer } from 'buffer';
 import Animated, {
   useSharedValue,
+  useAnimatedStyle,
+  withSpring,
+  interpolate,
+  Extrapolation,
 } from 'react-native-reanimated';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
-import { BlurView } from 'expo-blur';
 import { AudioContext, AudioBufferSourceNode } from 'react-native-audio-api';
 
 // Components
 import { ActiveOrb, OrbMode } from './components/ActiveOrb';
-import { StatusPill, ConnectionStatus } from './components/StatusPill';
+import { StatusPill } from './components/StatusPill';
+import { ControlSheet } from './components/ControlSheet';
+import { Viewfinder } from './components/Viewfinder';
+import { CallHistoryScreen } from './components/CallHistoryScreen';
+import { THEME } from './theme';
 
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
-const RELAY_SERVER_URL = 'ws://localhost:8082';
+const RELAY_SERVER_URL = 'ws://98.92.191.197:8082';
 const SAMPLE_RATE = 24000; // OpenAI Output Sample Rate
 
 // ============================================================================
@@ -34,6 +41,15 @@ const SAMPLE_RATE = 24000; // OpenAI Output Sample Rate
 const DEBUG_MODE = true;
 const DEBUG_VOLUME_INTERVAL = 10;
 let volumeLogCounter = 0;
+
+// ============================================================================
+// CLIENT-SIDE VAD CONFIGURATION (Optimistic Barge-In)
+// ============================================================================
+const CLIENT_VAD_CONFIG = {
+  threshold: 0.015,          // RMS threshold - very sensitive for normal speech
+  consecutiveFrames: 2,      // Reduced frames for faster response
+  enabled: true,             // Feature flag for A/B testing
+};
 
 const debugLog = (tag: string, message: string, data?: any) => {
   if (!DEBUG_MODE) return;
@@ -52,6 +68,7 @@ const AUDIO_RECORD_OPTIONS = {
   bitsPerSample: 16,
   audioSource: 6, // VOICE_RECOGNITION (Android)
   wavFile: 'speak_vision.wav',
+  bufferSize: 1920, // 40ms chunks
 };
 
 // ============================================================================
@@ -63,19 +80,22 @@ const MainScreen = () => {
   // -------------------------------------------------------------------------
   // STATE
   // -------------------------------------------------------------------------
-  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('disconnected');
+  const [connectionStatus, setConnectionStatus] = useState<string>('Offline');
+  const [isConnected, setIsConnected] = useState(false);
+  const [agentName, setAgentName] = useState('Assistant');
   const [interactionMode, setInteractionMode] = useState<OrbMode>('idle');
   const [permissionGranted, setPermissionGranted] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
-  const [transcriptText, setTranscriptText] = useState('');
-  const [showTranscript, setShowTranscript] = useState(false);
+
+  // UI States
+  const [isMuted, setIsMuted] = useState(false);
+  const [isCameraOn, setIsCameraOn] = useState(true);
+  const [isNoiseIsolationOn, setIsNoiseIsolationOn] = useState(true);
 
   // -------------------------------------------------------------------------
   // REFS
   // -------------------------------------------------------------------------
   const wsRef = useRef<WebSocket | null>(null);
   const audioRecordInitializedRef = useRef(false);
-  const isMutedRef = useRef(false);
 
   // Latency Tracking
   const lastSpeechStoppedTimeRef = useRef<number | null>(null);
@@ -88,6 +108,12 @@ const MainScreen = () => {
   const nextStartTimeRef = useRef<number>(0);
   const pendingSourcesRef = useRef<AudioBufferSourceNode[]>([]);
   const isPlayingRef = useRef(false);
+
+  // -------------------------------------------------------------------------
+  // CLIENT VAD STATE (Optimistic Barge-In)
+  // -------------------------------------------------------------------------
+  const vadFrameCountRef = useRef(0);
+  const clientVadTriggeredRef = useRef(false);
 
   // -------------------------------------------------------------------------
   // SHARED VALUES
@@ -169,9 +195,8 @@ const MainScreen = () => {
 
       // Log First Audio Playback Latency
       if (lastFirstAudioReceivedTimeRef.current && !isPlayingRef.current) {
-        // This is technically "Scheduled", actual sound comes a few ms later
-        // But for logic purposes, playback "starts" here.
         isPlayingRef.current = true;
+        console.log('[VAD DEBUG] 🎵 isPlayingRef set to TRUE - audio playback starting');
         const now = Date.now();
         const processingLag = now - lastFirstAudioReceivedTimeRef.current;
         console.log(`[CLIENT] [LATENCY] 🔊 Stream Started (Processing Lag: ${processingLag}ms)`);
@@ -193,7 +218,6 @@ const MainScreen = () => {
         if ((source as any)._hasEnded) return;
         (source as any)._hasEnded = true;
 
-        console.log('[AUDIO] Chunk ended');
         const index = pendingSourcesRef.current.indexOf(source);
         if (index > -1) pendingSourcesRef.current.splice(index, 1);
 
@@ -201,7 +225,6 @@ const MainScreen = () => {
         if (pendingSourcesRef.current.length === 0) {
           debugLog('MODE', '💤 Mode: → idle (playback complete)');
           setInteractionMode('idle');
-          isMutedRef.current = false;
           isPlayingRef.current = false;
         }
       };
@@ -225,12 +248,6 @@ const MainScreen = () => {
 
     // Reset Context Time
     nextStartTimeRef.current = 0;
-
-    // Optional: Suspend context to stop hardware (and save battery)
-    if (audioContextRef.current) {
-      audioContextRef.current.suspend();
-    }
-
     isPlayingRef.current = false;
   }, []);
 
@@ -276,26 +293,51 @@ const MainScreen = () => {
 
     AudioRecord.on('data', (base64Data: string) => {
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-      if (isMutedRef.current) return;
       if (!base64Data || base64Data.length < 50) return;
 
+      // Calculate RMS for visualization AND client VAD
+      const rms = calculateRMS(base64Data);
+
+      // =========================================================================
+      // 🚀 DIRTY CLIENT VAD
+      // =========================================================================
+      if (CLIENT_VAD_CONFIG.enabled && isPlayingRef.current && !clientVadTriggeredRef.current) {
+        if (rms > CLIENT_VAD_CONFIG.threshold) {
+          vadFrameCountRef.current++;
+
+          if (vadFrameCountRef.current >= CLIENT_VAD_CONFIG.consecutiveFrames) {
+            console.log(`[CLIENT] [VAD] ⚡ LOCAL INTERRUPT! RMS=${rms.toFixed(3)} frames=${vadFrameCountRef.current}`);
+            clientVadTriggeredRef.current = true;
+            stopAudioPlayback();
+
+            wsRef.current?.send(JSON.stringify({
+              type: 'response.cancel',
+            }));
+          }
+        } else {
+          vadFrameCountRef.current = 0;
+        }
+      } else if (!isPlayingRef.current && !isMuted) {
+        vadFrameCountRef.current = 0;
+        clientVadTriggeredRef.current = false;
+      }
+
+      // Early return if muted
+      if (isMuted) return;
+
+      // Update volume visualization
+      volumeLevel.value = rms;
+
+      // Send audio to server
       wsRef.current.send(JSON.stringify({
         type: 'input_audio_buffer.append',
         audio: base64Data,
       }));
-
-      const rms = calculateRMS(base64Data);
-      volumeLevel.value = rms;
-
-      volumeLogCounter++;
-      if (volumeLogCounter % DEBUG_VOLUME_INTERVAL === 0) {
-        debugLog('VOLUME', `RMS: ${rms.toFixed(3)} | Bar: ${'█'.repeat(Math.floor(rms * 20))}${'░'.repeat(20 - Math.floor(rms * 20))}`);
-      }
     });
 
     audioRecordInitializedRef.current = true;
     return true;
-  }, [calculateRMS, volumeLevel]);
+  }, [calculateRMS, volumeLevel, stopAudioPlayback, isMuted]);
 
   // -------------------------------------------------------------------------
   // RECORDING CONTROLS
@@ -309,21 +351,13 @@ const MainScreen = () => {
     stopAudioPlayback();
 
     AudioRecord.start();
-    setIsRecording(true);
     debugLog('MODE', '👂 Mode: → listening (recording started)');
     setInteractionMode('listening');
   }, [permissionGranted, initAudioRecord, stopAudioPlayback]);
 
   const stopRecording = useCallback(() => {
     try { AudioRecord.stop(); } catch { }
-    setIsRecording(false);
     volumeLevel.value = 0;
-
-    // If we simply stopped recording manually, we go to idle
-    // But usually 'speech_stopped' handles the transition to 'processing'
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      // Just visual reset if needed
-    }
     console.log('[CLIENT] Recording stopped');
   }, [volumeLevel]);
 
@@ -342,7 +376,11 @@ const MainScreen = () => {
       switch (eventType) {
         case 'session.created':
           console.log('[CLIENT] Session created');
-          initAudioContext(); // Warm up audio engine
+          initAudioContext();
+          setConnectionStatus('AI Connected');
+          setIsConnected(true);
+          // Start recording audio immediately upon connection
+          startRecording();
           break;
 
         case 'session.updated':
@@ -350,9 +388,8 @@ const MainScreen = () => {
           break;
 
         case 'response.audio.delta':
-          // Mute mic immediately
-          isMutedRef.current = true;
-
+          // Auto-mute mic during playback if not using VAD-based interruption
+          // But here we rely on VAD, so we don't force mute unless user muted manually
           if (interactionMode !== 'speaking') {
             debugLog('MODE', '🗣️ Mode: → speaking (streaming started)');
             setInteractionMode('speaking');
@@ -362,7 +399,7 @@ const MainScreen = () => {
           if (lastSpeechStoppedTimeRef.current && !lastFirstAudioReceivedTimeRef.current) {
             lastFirstAudioReceivedTimeRef.current = Date.now();
             const latency = lastFirstAudioReceivedTimeRef.current - lastSpeechStoppedTimeRef.current;
-            console.log(`[CLIENT] [LATENCY] 📥 First Audio Delta Received (Time from Speech Stop: ${latency}ms)`);
+            console.log(`[CLIENT] [LATENCY] 📥 First Audio Delta Received: ${latency}ms`);
           }
 
           if (data.delta) {
@@ -370,56 +407,53 @@ const MainScreen = () => {
           }
           break;
 
-        case 'response.audio.done':
-          // End of stream - we don't need to do anything, 
-          // logic is handled by 'onended' of the source nodes.
-          break;
-
-        case 'response.audio_transcript.delta':
-          if (data.delta) {
-            setTranscriptText((prev) => prev + data.delta);
-            setShowTranscript(true);
-          }
-          break;
-
         case 'input_audio_buffer.speech_started':
-          console.log('[CLIENT] INTERRUPT - User speaking');
+          console.log('[CLIENT] INTERRUPT - User speaking (server VAD)');
           debugLog('MODE', '⚡ INTERRUPT! Mode: → listening');
 
-          // CRITICAL: Stop AI speech immediately
           stopAudioPlayback();
-          isMutedRef.current = false;
+
+          // Reset client VAD state
+          vadFrameCountRef.current = 0;
+          clientVadTriggeredRef.current = false;
 
           setInteractionMode('listening');
-          setShowTranscript(false);
-          setTranscriptText('');
           break;
 
         case 'input_audio_buffer.speech_stopped':
           debugLog('MODE', '🧠 Mode: → processing');
           lastSpeechStoppedTimeRef.current = Date.now();
           lastFirstAudioReceivedTimeRef.current = null;
-          console.log(`[CLIENT] [LATENCY] 🛑 Speech Stopped at ${lastSpeechStoppedTimeRef.current}`);
           setInteractionMode('processing');
-          break;
-
-        case 'error':
-        case 'relay.error':
-          console.error('[CLIENT] Error:', data.error);
           break;
       }
     } catch (e) {
       console.log('[CLIENT] Non-JSON message received');
     }
-  }, [scheduleAudioChunk, stopAudioPlayback, interactionMode, initAudioContext]);
+  }, [scheduleAudioChunk, stopAudioPlayback, interactionMode, initAudioContext, startRecording]);
 
   // -------------------------------------------------------------------------
   // WEBSOCKET CONNECTION
   // -------------------------------------------------------------------------
-  const connect = useCallback(() => {
+  const BYPASS_BACKEND = true; // Toggle this to true to test UI without backend
+
+  const connect = useCallback((name: string = 'Assistant') => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
-    debugLog('CONNECTION', '🟡 Connecting...');
-    setConnectionStatus('connecting');
+
+    setAgentName(name);
+    debugLog('CONNECTION', `🟡 Connecting to ${name}...`);
+    setConnectionStatus('Connecting...');
+
+    if (BYPASS_BACKEND) {
+      console.log('[CLIENT] BYPASS_BACKEND active. Simulating connection...');
+      setTimeout(() => {
+        setConnectionStatus('AI Connected');
+        setIsConnected(true);
+        setInteractionMode('listening');
+        debugLog('CONNECTION', '🟢 Connected (Simulated)');
+      }, 1500);
+      return;
+    }
 
     const ws = new WebSocket(RELAY_SERVER_URL);
     wsRef.current = ws;
@@ -427,7 +461,6 @@ const MainScreen = () => {
     ws.onopen = () => {
       console.log('[CLIENT] Connected');
       debugLog('CONNECTION', '🟢 Connected');
-      setConnectionStatus('connected');
     };
 
     ws.onmessage = handleMessage;
@@ -436,7 +469,8 @@ const MainScreen = () => {
     ws.onclose = () => {
       console.log('[CLIENT] Disconnected');
       debugLog('CONNECTION', '🔴 Disconnected');
-      setConnectionStatus('disconnected');
+      setConnectionStatus('Offline');
+      setIsConnected(false);
       setInteractionMode('idle');
       wsRef.current = null;
       stopAudioPlayback();
@@ -447,14 +481,20 @@ const MainScreen = () => {
   const disconnect = useCallback(() => {
     stopRecording();
     stopAudioPlayback();
+
+    if (BYPASS_BACKEND) {
+      setConnectionStatus('Offline');
+      setIsConnected(false);
+      setInteractionMode('idle');
+      return;
+    }
+
     if (wsRef.current) {
       wsRef.current.close(1000, 'User disconnected');
       wsRef.current = null;
     }
-    setConnectionStatus('disconnected');
-    setInteractionMode('idle');
-    setShowTranscript(false);
-    setTranscriptText('');
+    setConnectionStatus('Offline');
+    setIsConnected(false);
   }, [stopRecording, stopAudioPlayback]);
 
   // -------------------------------------------------------------------------
@@ -474,88 +514,96 @@ const MainScreen = () => {
     };
   }, [requestMicrophonePermission, stopRecording, stopAudioPlayback]);
 
-  // -------------------------------------------------------------------------
-  // UI HANDLERS
-  // -------------------------------------------------------------------------
-  const handleConnectPress = () => {
-    if (connectionStatus === 'connected') disconnect();
-    else if (connectionStatus === 'disconnected') connect();
-  };
-
-  const handleTalkPress = () => {
-    if (connectionStatus !== 'connected') return;
-    if (isRecording) stopRecording();
-    else startRecording();
-  };
 
   // -------------------------------------------------------------------------
-  // RENDER (Same UI as before)
+  // AUTO-CONNECT FOR DEMO (Optional)
+  // -------------------------------------------------------------------------
+  useEffect(() => {
+    // connect(); // Uncomment to auto-connect on load
+  }, [connect]);
+
+
+  const showCallUI = isConnected || connectionStatus === 'Connecting...';
+
+  // -------------------------------------------------------------------------
+  // ANIMATION STATE & STYLES
+  // -------------------------------------------------------------------------
+  const animState = useSharedValue(0); // 0 = Disconnected (Sheet visible), 1 = Connected (UI visible)
+  const { height: SCREEN_HEIGHT } = Dimensions.get('window');
+
+  useEffect(() => {
+    // If showCallUI is true (Connecting or Connected), animate to 1
+    // If false (Offline), animate to 0
+    animState.value = withSpring(showCallUI ? 1 : 0, {
+      damping: 20,
+      stiffness: 90,
+      mass: 0.5, // Lightweight feel
+    });
+  }, [showCallUI]);
+
+  const sheetStyle = useAnimatedStyle(() => {
+    return {
+      // Slide down off screen
+      transform: [{
+        translateY: interpolate(animState.value, [0, 1], [0, SCREEN_HEIGHT], Extrapolation.CLAMP)
+      }],
+    };
+  });
+
+  const uiLayerStyle = useAnimatedStyle(() => {
+    return {
+      opacity: interpolate(animState.value, [0, 0.5, 1], [0, 0, 1], Extrapolation.CLAMP),
+      transform: [{
+        translateY: interpolate(animState.value, [0, 1], [50, 0], Extrapolation.CLAMP)
+      }],
+      zIndex: animState.value > 0.5 ? 10 : 0,
+    };
+  });
+
+
+  // -------------------------------------------------------------------------
+  // RENDER
   // -------------------------------------------------------------------------
   return (
     <View style={styles.container}>
       <StatusBar barStyle="light-content" />
-      <View style={styles.background} />
 
-      <View style={[styles.topContainer, { paddingTop: insets.top + 12 }]}>
-        <StatusPill status={connectionStatus} />
-      </View>
+      {/* LAYER 1: Viewfinder Background (Always active but obscured by Sheet initially) */}
+      <Viewfinder isCameraOn={isCameraOn} />
 
-      <View style={styles.orbContainer}>
-        <ActiveOrb mode={interactionMode} volumeLevel={volumeLevel} />
-      </View>
+      {/* LAYER 2: Main Call UI (Fade In / Slide Up) */}
+      <Animated.View
+        style={[
+          styles.uiLayer,
+          { paddingTop: insets.top, paddingBottom: insets.bottom },
+          uiLayerStyle
+        ]}
+        pointerEvents={showCallUI ? 'auto' : 'none'}
+      >
+        {/* Top Status */}
+        <StatusPill status={isConnected ? `Connected to ${agentName}` : connectionStatus} isConnected={isConnected} />
 
-      {showTranscript && transcriptText && (
-        <View style={[styles.transcriptContainer, { paddingBottom: insets.bottom + 120 }]}>
-          <BlurView intensity={60} tint="dark" style={styles.transcriptBlur}>
-            <Text style={styles.transcriptLabel}>AI Response</Text>
-            <View style={styles.transcriptDivider} />
-            <Text style={styles.transcriptText}>
-              {transcriptText}
-              <Text style={styles.cursor}>|</Text>
-            </Text>
-          </BlurView>
+        {/* Center Orb (smaller, integrated) */}
+        <View style={styles.orbContainer}>
+          <ActiveOrb mode={interactionMode} volumeLevel={volumeLevel} />
         </View>
-      )}
 
-      <View style={[styles.controlsContainer, { paddingBottom: insets.bottom + 24 }]}>
-        <TouchableOpacity
-          style={[
-            styles.controlButton,
-            connectionStatus === 'connecting' && styles.buttonDisabled,
-            connectionStatus === 'connected' && styles.buttonDisconnect,
-          ]}
-          onPress={handleConnectPress}
-          disabled={connectionStatus === 'connecting'}
-        >
-          <Text style={styles.buttonText}>
-            {connectionStatus === 'connected' ? 'Disconnect' : 'Connect'}
-          </Text>
-        </TouchableOpacity>
+        {/* Bottom Controls */}
+        <ControlSheet
+          onDisconnect={disconnect}
+          isMuted={isMuted}
+          onToggleMute={() => setIsMuted(!isMuted)}
+          isCameraOn={isCameraOn}
+          onToggleCamera={() => setIsCameraOn(!isCameraOn)}
+          isNoiseIsolationOn={isNoiseIsolationOn}
+          onToggleNoiseIsolation={() => setIsNoiseIsolationOn(!isNoiseIsolationOn)}
+        />
+      </Animated.View>
 
-        <TouchableOpacity
-          style={[
-            styles.controlButton,
-            styles.talkButton,
-            isRecording && styles.talkButtonActive,
-            connectionStatus !== 'connected' && styles.buttonDisabled,
-          ]}
-          onPress={handleTalkPress}
-          disabled={connectionStatus !== 'connected'}
-        >
-          <Text style={[
-            styles.buttonText,
-            connectionStatus !== 'connected' && styles.buttonTextDisabled,
-          ]}>
-            {isRecording ? 'Stop' : 'Push to Talk'}
-          </Text>
-        </TouchableOpacity>
-      </View>
-
-      <View style={[styles.footer, { bottom: insets.bottom + 8 }]}>
-        <Text style={styles.footerText}>
-          {RELAY_SERVER_URL} | PCM16 24kHz Streaming
-        </Text>
-      </View>
+      {/* LAYER 3: Call History / Start Screen (Slides Down) */}
+      <Animated.View style={[StyleSheet.absoluteFill, sheetStyle]}>
+        <CallHistoryScreen onConnect={connect} />
+      </Animated.View>
     </View>
   );
 };
@@ -573,110 +621,15 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#000',
   },
-  background: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: '#0a0a0a',
-  },
-  topContainer: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    alignItems: 'center',
+  uiLayer: {
+    flex: 1,
+    justifyContent: 'space-between',
     zIndex: 10,
   },
   orbContainer: {
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-  },
-  transcriptContainer: {
-    position: 'absolute',
-    bottom: 0,
-    left: 16,
-    right: 16,
-    maxHeight: 200,
-  },
-  transcriptBlur: {
-    borderRadius: 20,
-    padding: 16,
-    backgroundColor: 'rgba(20,20,20,0.7)',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.1)',
-    overflow: 'hidden',
-  },
-  transcriptLabel: {
-    color: '#888',
-    fontSize: 11,
-    fontWeight: '700',
-    letterSpacing: 1,
-    textTransform: 'uppercase',
-    marginBottom: 8,
-  },
-  transcriptDivider: {
-    height: 1,
-    backgroundColor: 'rgba(255,255,255,0.1)',
-    marginBottom: 10,
-  },
-  transcriptText: {
-    color: '#eee',
-    fontSize: 16,
-    lineHeight: 22,
-  },
-  cursor: {
-    color: '#00f260',
-    fontWeight: '700',
-  },
-  controlsContainer: {
-    position: 'absolute',
-    bottom: 0,
-    left: 0,
-    right: 0,
-    paddingHorizontal: 24,
-    flexDirection: 'row',
-    gap: 12,
-  },
-  controlButton: {
-    flex: 1,
-    backgroundColor: '#1a1a1a',
-    paddingVertical: 16,
-    borderRadius: 14,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.1)',
-  },
-  buttonDisabled: {
-    backgroundColor: '#1a1a1a',
-    opacity: 0.5,
-  },
-  buttonDisconnect: {
-    backgroundColor: 'rgba(200,60,60,0.3)',
-    borderColor: 'rgba(200,60,60,0.5)',
-  },
-  talkButton: {
-    backgroundColor: 'rgba(0,150,255,0.2)',
-    borderColor: 'rgba(0,150,255,0.4)',
-  },
-  talkButtonActive: {
-    backgroundColor: 'rgba(255,100,0,0.3)',
-    borderColor: 'rgba(255,100,0,0.5)',
-  },
-  buttonText: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: '600',
-  },
-  buttonTextDisabled: {
-    color: '#555',
-  },
-  footer: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    alignItems: 'center',
-  },
-  footerText: {
-    color: '#333',
-    fontSize: 10,
+    // Make orbit smaller or transparent if needed
   },
 });
