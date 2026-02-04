@@ -18,7 +18,7 @@ export const FeatureToggle = ({ icon: Icon, label, isActive, onPress }: FeatureT
             activeOpacity={0.8}
         >
             <Icon
-                size={20}
+                size={16}
                 color={isActive ? THEME.colors.iconActive : THEME.colors.iconDefault}
             />
             <Text style={[styles.label, isActive ? styles.labelActive : styles.labelInactive]}>
@@ -34,10 +34,10 @@ const styles = StyleSheet.create({
         flexDirection: 'row',
         alignItems: 'center',
         justifyContent: 'center',
-        paddingVertical: THEME.spacing.lg,
-        paddingHorizontal: THEME.spacing.md,
-        borderRadius: THEME.borderRadius.xl, // Increased from lg for rounder corners
-        gap: THEME.spacing.sm,
+        paddingVertical: THEME.spacing.sm,
+        paddingHorizontal: THEME.spacing.sm,
+        borderRadius: THEME.borderRadius.xl,
+        gap: THEME.spacing.xs,
     },
     inactive: {
         backgroundColor: THEME.colors.controlBackground,
@@ -46,7 +46,7 @@ const styles = StyleSheet.create({
         backgroundColor: THEME.colors.controlActive,
     },
     label: {
-        fontSize: 14,
+        ...THEME.typography.caption1,
         fontWeight: '600',
     },
     labelInactive: {

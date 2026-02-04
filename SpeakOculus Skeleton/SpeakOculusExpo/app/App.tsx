@@ -5,51 +5,61 @@ import {
   StatusBar,
   Platform,
   PermissionsAndroid,
-  Text,
   Dimensions,
+  ActivityIndicator,
 } from 'react-native';
-import { Audio } from 'expo-av';
+import {
+  useFonts,
+  Inter_400Regular,
+  Inter_500Medium,
+  Inter_600SemiBold,
+  Inter_700Bold,
+} from '@expo-google-fonts/inter';
 import AudioRecord from 'react-native-audio-record';
 import { Buffer } from 'buffer';
 import Animated, {
   useSharedValue,
   useAnimatedStyle,
   withSpring,
+  withTiming,
   interpolate,
   Extrapolation,
+  Easing,
+  runOnJS,
 } from 'react-native-reanimated';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { AudioContext, AudioBufferSourceNode } from 'react-native-audio-api';
+import * as Haptics from 'expo-haptics';
+import * as ImageManipulator from 'expo-image-manipulator';
 
 // Components
 import { ActiveOrb, OrbMode } from './components/ActiveOrb';
 import { StatusPill } from './components/StatusPill';
 import { ControlSheet } from './components/ControlSheet';
-import { Viewfinder } from './components/Viewfinder';
+import { Viewfinder, CameraFacing, ViewfinderRef } from './components/Viewfinder';
 import { CallHistoryScreen } from './components/CallHistoryScreen';
 import { THEME } from './theme';
+
+// Hooks
+import { useCameraStabilityWithReset } from './hooks/useCameraStability';
 
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
 const RELAY_SERVER_URL = 'ws://98.92.191.197:8082';
-const SAMPLE_RATE = 24000; // OpenAI Output Sample Rate
+const SAMPLE_RATE = 24000; // OpenAI Realtime API requirement
+
+// Vision Configuration
+const VISION_COOLDOWN_MS = 8000; // 8 seconds between captures
+const FLASH_DURATION_MS = 150; // Flash animation duration
+const CROSSHAIR_SIZE = 280; // Size of the viewfinder box (must match ActiveOrb)
+const CROSSHAIR_RADIUS = 40; // Corner radius of the viewfinder box
 
 // ============================================================================
 // DEBUG MODE
 // ============================================================================
 const DEBUG_MODE = true;
-const DEBUG_VOLUME_INTERVAL = 10;
-let volumeLogCounter = 0;
 
-// ============================================================================
-// CLIENT-SIDE VAD CONFIGURATION (Optimistic Barge-In)
-// ============================================================================
-const CLIENT_VAD_CONFIG = {
-  threshold: 0.015,          // RMS threshold - very sensitive for normal speech
-  consecutiveFrames: 2,      // Reduced frames for faster response
-  enabled: true,             // Feature flag for A/B testing
-};
 
 const debugLog = (tag: string, message: string, data?: any) => {
   if (!DEBUG_MODE) return;
@@ -61,14 +71,38 @@ const debugLog = (tag: string, message: string, data?: any) => {
   }
 };
 
-// AudioRecord configuration for Microphone
+// AudioRecord configuration for Microphone (PCM16 @ 24kHz)
 const AUDIO_RECORD_OPTIONS = {
   sampleRate: 24000,
   channels: 1,
   bitsPerSample: 16,
   audioSource: 6, // VOICE_RECOGNITION (Android)
   wavFile: 'speak_vision.wav',
-  bufferSize: 1920, // 40ms chunks
+  bufferSize: 1920, // 40ms chunks at 24kHz
+};
+
+// ============================================================================
+// FLASH OVERLAY COMPONENT (Box-sized, centered on crosshair)
+// ============================================================================
+interface FlashOverlayProps {
+  flashOpacity: Animated.SharedValue<number>;
+}
+
+const FlashOverlay: React.FC<FlashOverlayProps> = ({ flashOpacity }) => {
+  const animatedStyle = useAnimatedStyle(() => {
+    'worklet';
+    return {
+      opacity: flashOpacity.value,
+    };
+  });
+
+  return (
+    <View style={styles.flashOverlayContainer} pointerEvents="none">
+      <Animated.View
+        style={[styles.flashOverlayBox, animatedStyle]}
+      />
+    </View>
+  );
 };
 
 // ============================================================================
@@ -89,17 +123,30 @@ const MainScreen = () => {
   // UI States
   const [isMuted, setIsMuted] = useState(false);
   const [isCameraOn, setIsCameraOn] = useState(true);
+  const [cameraFacing, setCameraFacing] = useState<CameraFacing>('front');
   const [isNoiseIsolationOn, setIsNoiseIsolationOn] = useState(true);
+
+  // Vision States
+  const [visionEnabled, setVisionEnabled] = useState(true);
+  const [isCapturing, setIsCapturing] = useState(false);
+
+  // Ref to track mute state in audio callback (avoids stale closure)
+  const isMutedRef = useRef(false);
 
   // -------------------------------------------------------------------------
   // REFS
   // -------------------------------------------------------------------------
   const wsRef = useRef<WebSocket | null>(null);
   const audioRecordInitializedRef = useRef(false);
+  const viewfinderRef = useRef<ViewfinderRef>(null);
 
   // Latency Tracking
   const lastSpeechStoppedTimeRef = useRef<number | null>(null);
   const lastFirstAudioReceivedTimeRef = useRef<number | null>(null);
+
+  // Vision Tracking
+  const lastCaptureTimeRef = useRef<number>(0);
+  const captureInProgressRef = useRef(false);
 
   // -------------------------------------------------------------------------
   // AUDIO CONTEXT & STREAMING REFS
@@ -109,16 +156,29 @@ const MainScreen = () => {
   const pendingSourcesRef = useRef<AudioBufferSourceNode[]>([]);
   const isPlayingRef = useRef(false);
 
-  // -------------------------------------------------------------------------
-  // CLIENT VAD STATE (Optimistic Barge-In)
-  // -------------------------------------------------------------------------
-  const vadFrameCountRef = useRef(0);
-  const clientVadTriggeredRef = useRef(false);
 
   // -------------------------------------------------------------------------
   // SHARED VALUES
   // -------------------------------------------------------------------------
   const volumeLevel = useSharedValue(0);
+  const flashOpacity = useSharedValue(0);
+
+  // Sync isMuted state to ref for use in audio callback (avoids stale closure)
+  useEffect(() => {
+    isMutedRef.current = isMuted;
+  }, [isMuted]);
+
+  // -------------------------------------------------------------------------
+  // STABILITY HOOK (Auto-Vision Trigger)
+  // -------------------------------------------------------------------------
+  const {
+    isStable,
+    stabilityProgress,
+    variance,
+    resetStability,
+  } = useCameraStabilityWithReset({
+    enabled: visionEnabled && isConnected && isCameraOn && !isCapturing,
+  });
 
   // -------------------------------------------------------------------------
   // UTILITY: Calculate RMS volume
@@ -138,6 +198,189 @@ const MainScreen = () => {
       return 0;
     }
   }, []);
+
+  // -------------------------------------------------------------------------
+  // FLASH ANIMATION
+  // -------------------------------------------------------------------------
+  const triggerFlash = useCallback(() => {
+    'worklet';
+    flashOpacity.value = 0.8;
+    flashOpacity.value = withTiming(0, {
+      duration: FLASH_DURATION_MS,
+      easing: Easing.out(Easing.cubic),
+    });
+  }, [flashOpacity]);
+
+  // -------------------------------------------------------------------------
+  // VISION CAPTURE LOGIC
+  // -------------------------------------------------------------------------
+  const captureAndSendFrame = useCallback(async () => {
+    // Guard: Prevent concurrent captures
+    if (captureInProgressRef.current) {
+      debugLog('VISION', 'Capture already in progress, skipping');
+      return;
+    }
+
+    // Guard: Check cooldown
+    const now = Date.now();
+    const timeSinceLastCapture = now - lastCaptureTimeRef.current;
+    if (timeSinceLastCapture < VISION_COOLDOWN_MS) {
+      debugLog('VISION', `Cooldown active (${Math.round((VISION_COOLDOWN_MS - timeSinceLastCapture) / 1000)}s remaining)`);
+      return;
+    }
+
+    // Guard: Check if AI is speaking (don't interrupt)
+    if (isPlayingRef.current) {
+      debugLog('VISION', 'AI is speaking, skipping capture');
+      return;
+    }
+
+    // Guard: Check camera ref
+    if (!viewfinderRef.current) {
+      debugLog('VISION', 'Camera ref not available');
+      return;
+    }
+
+    // Guard: Check WebSocket
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      debugLog('VISION', 'WebSocket not connected');
+      return;
+    }
+
+    try {
+      captureInProgressRef.current = true;
+      setIsCapturing(true);
+
+      // 1. Trigger flash animation (run on UI thread)
+      runOnJS(triggerFlash)();
+
+      // 2. Set mode to processing
+      setInteractionMode('processing');
+
+      // 3. Capture photo (silent - no shutter sound)
+      debugLog('VISION', 'Capturing frame...');
+      const photo = await viewfinderRef.current.takePictureAsync({
+        quality: 0.7, // Higher quality for cropping
+        base64: true,
+        skipProcessing: true,
+        shutterSound: false, // Disable shutter sound
+      });
+
+      if (!photo?.base64 || !photo.uri) {
+        console.error('[VISION] Failed to capture photo - no base64 data');
+        setInteractionMode('listening');
+        return;
+      }
+
+      debugLog('VISION', `Photo captured: ${photo.width}x${photo.height}`);
+
+      // 5. Crop to crosshair region (center square)
+      const { width: screenWidth, height: screenHeight } = Dimensions.get('window');
+
+      // Calculate the crosshair box position in screen coordinates
+      // The crosshair is centered on screen and is CROSSHAIR_SIZE x CROSSHAIR_SIZE
+      const crosshairScreenX = (screenWidth - CROSSHAIR_SIZE) / 2;
+      const crosshairScreenY = (screenHeight - CROSSHAIR_SIZE) / 2;
+
+      // Map screen coordinates to photo coordinates
+      // Photo aspect ratio may differ from screen, so we need to handle this
+      const photoAspect = photo.width / photo.height;
+      const screenAspect = screenWidth / screenHeight;
+
+      let scaleX: number, scaleY: number, offsetX = 0, offsetY = 0;
+
+      if (photoAspect > screenAspect) {
+        // Photo is wider than screen - crop sides
+        scaleY = photo.height / screenHeight;
+        scaleX = scaleY;
+        offsetX = (photo.width - screenWidth * scaleX) / 2;
+      } else {
+        // Photo is taller than screen - crop top/bottom
+        scaleX = photo.width / screenWidth;
+        scaleY = scaleX;
+        offsetY = (photo.height - screenHeight * scaleY) / 2;
+      }
+
+      // Calculate crop region in photo coordinates
+      const cropX = Math.max(0, Math.round(offsetX + crosshairScreenX * scaleX));
+      const cropY = Math.max(0, Math.round(offsetY + crosshairScreenY * scaleY));
+      const cropSize = Math.round(CROSSHAIR_SIZE * scaleX);
+
+      // Ensure crop doesn't exceed photo bounds
+      const finalCropX = Math.min(cropX, photo.width - cropSize);
+      const finalCropY = Math.min(cropY, photo.height - cropSize);
+      const finalCropSize = Math.min(cropSize, photo.width - finalCropX, photo.height - finalCropY);
+
+      debugLog('VISION', `Cropping to: x=${finalCropX}, y=${finalCropY}, size=${finalCropSize}`);
+
+      // Crop and resize the image
+      const croppedImage = await ImageManipulator.manipulateAsync(
+        photo.uri,
+        [
+          {
+            crop: {
+              originX: finalCropX,
+              originY: finalCropY,
+              width: finalCropSize,
+              height: finalCropSize,
+            },
+          },
+          {
+            resize: { width: 512, height: 512 }, // Standardize output size
+          },
+        ],
+        { base64: true, compress: 0.7, format: ImageManipulator.SaveFormat.JPEG }
+      );
+
+      if (!croppedImage.base64) {
+        console.error('[VISION] Failed to crop photo');
+        setInteractionMode('listening');
+        return;
+      }
+
+      debugLog('VISION', `Cropped image: 512x512, base64 length: ${croppedImage.base64.length}`);
+
+      // 6. Send to WebSocket
+      const payload = {
+        type: 'vision.direct_injection',
+        image: croppedImage.base64,
+        timestamp: now,
+      };
+
+      wsRef.current.send(JSON.stringify(payload));
+      debugLog('VISION', 'Frame sent to server');
+
+      // 6. Update cooldown
+      lastCaptureTimeRef.current = now;
+
+      // 7. Reset stability tracking
+      resetStability();
+
+    } catch (error) {
+      console.error('[VISION] Capture error:', error);
+      setInteractionMode('listening');
+    } finally {
+      captureInProgressRef.current = false;
+      setIsCapturing(false);
+    }
+  }, [triggerFlash, resetStability]);
+
+  // -------------------------------------------------------------------------
+  // STABILITY-TRIGGERED CAPTURE
+  // -------------------------------------------------------------------------
+  useEffect(() => {
+    if (isStable && !isCapturing && !isPlayingRef.current) {
+      debugLog('VISION', 'Device stable - triggering capture');
+      captureAndSendFrame();
+    }
+  }, [isStable, isCapturing, captureAndSendFrame]);
+
+  // Log stability progress for debugging
+  useEffect(() => {
+    if (stabilityProgress > 0 && stabilityProgress < 1) {
+      debugLog('STABILITY', `Progress: ${Math.round(stabilityProgress * 100)}%, Variance: ${variance.toFixed(4)}`);
+    }
+  }, [stabilityProgress, variance]);
 
   // -------------------------------------------------------------------------
   // STREAMING AUDIO LOGIC
@@ -193,16 +436,20 @@ const MainScreen = () => {
       const startTime = Math.max(ctx.currentTime, nextStartTimeRef.current);
       source.start(startTime);
 
-      // Log First Audio Playback Latency
-      if (lastFirstAudioReceivedTimeRef.current && !isPlayingRef.current) {
+      // Mark as playing (for echo prevention) - ALWAYS set this when audio starts
+      if (!isPlayingRef.current) {
         isPlayingRef.current = true;
-        console.log('[VAD DEBUG] 🎵 isPlayingRef set to TRUE - audio playback starting');
+        console.log('[AUDIO] Playback starting - mic suppressed');
+      }
+
+      // Log First Audio Playback Latency (optional tracking)
+      if (lastFirstAudioReceivedTimeRef.current) {
         const now = Date.now();
         const processingLag = now - lastFirstAudioReceivedTimeRef.current;
-        console.log(`[CLIENT] [LATENCY] 🔊 Stream Started (Processing Lag: ${processingLag}ms)`);
+        console.log(`[CLIENT] [LATENCY] Stream Started (Processing Lag: ${processingLag}ms)`);
 
         if (lastSpeechStoppedTimeRef.current) {
-          console.log(`[CLIENT] [LATENCY] ⚡ TOTAL E2E LATENCY: ${now - lastSpeechStoppedTimeRef.current}ms`);
+          console.log(`[CLIENT] [LATENCY] TOTAL E2E LATENCY: ${now - lastSpeechStoppedTimeRef.current}ms`);
         }
         lastFirstAudioReceivedTimeRef.current = null;
       }
@@ -223,7 +470,7 @@ const MainScreen = () => {
 
         // If queue empty, we are idle
         if (pendingSourcesRef.current.length === 0) {
-          debugLog('MODE', '💤 Mode: → idle (playback complete)');
+          debugLog('MODE', 'Mode: -> idle (playback complete)');
           setInteractionMode('idle');
           isPlayingRef.current = false;
         }
@@ -268,8 +515,10 @@ const MainScreen = () => {
         );
         return granted === PermissionsAndroid.RESULTS.GRANTED;
       } else {
-        const { status } = await Audio.requestPermissionsAsync();
-        return status === 'granted';
+        // iOS: Permission is requested automatically by react-native-audio-record
+        // when recording starts. Return true to proceed.
+        console.log('[CLIENT] iOS: Mic permission handled by native module');
+        return true;
       }
     } catch (error) {
       console.error('[CLIENT] Permission error:', error);
@@ -295,40 +544,43 @@ const MainScreen = () => {
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
       if (!base64Data || base64Data.length < 50) return;
 
-      // Calculate RMS for visualization AND client VAD
+      // Calculate RMS for visualization
       const rms = calculateRMS(base64Data);
 
-      // =========================================================================
-      // 🚀 DIRTY CLIENT VAD
-      // =========================================================================
-      if (CLIENT_VAD_CONFIG.enabled && isPlayingRef.current && !clientVadTriggeredRef.current) {
-        if (rms > CLIENT_VAD_CONFIG.threshold) {
-          vadFrameCountRef.current++;
-
-          if (vadFrameCountRef.current >= CLIENT_VAD_CONFIG.consecutiveFrames) {
-            console.log(`[CLIENT] [VAD] ⚡ LOCAL INTERRUPT! RMS=${rms.toFixed(3)} frames=${vadFrameCountRef.current}`);
-            clientVadTriggeredRef.current = true;
-            stopAudioPlayback();
-
-            wsRef.current?.send(JSON.stringify({
-              type: 'response.cancel',
-            }));
-          }
-        } else {
-          vadFrameCountRef.current = 0;
-        }
-      } else if (!isPlayingRef.current && !isMuted) {
-        vadFrameCountRef.current = 0;
-        clientVadTriggeredRef.current = false;
+      // Early return if muted (use ref to avoid stale closure)
+      if (isMutedRef.current) {
+        // Still update visualization when muted (shows user they're speaking but muted)
+        volumeLevel.value = withSpring(rms * 0.3, {
+          damping: 15,
+          stiffness: 400,
+          mass: 0.5,
+        });
+        return;
       }
 
-      // Early return if muted
-      if (isMuted) return;
+      // =========================================================================
+      // ECHO PREVENTION: Don't send audio while AI is speaking
+      // This prevents the AI from hearing its own audio through the mic.
+      // =========================================================================
+      if (isPlayingRef.current) {
+        // Show dimmed visualization to indicate mic is suppressed during AI speech
+        volumeLevel.value = withSpring(rms * 0.2, {
+          damping: 15,
+          stiffness: 400,
+          mass: 0.5,
+        });
+        return;
+      }
 
-      // Update volume visualization
-      volumeLevel.value = rms;
+      // Update volume visualization with fast spring for smooth 60fps reactivity
+      // Springs handle interruption gracefully (unlike withTiming)
+      volumeLevel.value = withSpring(rms, {
+        damping: 15,
+        stiffness: 400,
+        mass: 0.5,
+      });
 
-      // Send audio to server
+      // Send audio to relay server (only when AI is NOT speaking)
       wsRef.current.send(JSON.stringify({
         type: 'input_audio_buffer.append',
         audio: base64Data,
@@ -337,7 +589,7 @@ const MainScreen = () => {
 
     audioRecordInitializedRef.current = true;
     return true;
-  }, [calculateRMS, volumeLevel, stopAudioPlayback, isMuted]);
+  }, [calculateRMS, volumeLevel]);
 
   // -------------------------------------------------------------------------
   // RECORDING CONTROLS
@@ -351,7 +603,7 @@ const MainScreen = () => {
     stopAudioPlayback();
 
     AudioRecord.start();
-    debugLog('MODE', '👂 Mode: → listening (recording started)');
+    debugLog('MODE', 'Mode: -> listening (recording started)');
     setInteractionMode('listening');
   }, [permissionGranted, initAudioRecord, stopAudioPlayback]);
 
@@ -370,7 +622,7 @@ const MainScreen = () => {
       const eventType = data.type || 'unknown';
 
       if (!eventType.includes('audio.delta')) {
-        debugLog('WS_EVENT', `← ${eventType}`);
+        debugLog('WS_EVENT', `<- ${eventType}`);
       }
 
       switch (eventType) {
@@ -388,10 +640,8 @@ const MainScreen = () => {
           break;
 
         case 'response.audio.delta':
-          // Auto-mute mic during playback if not using VAD-based interruption
-          // But here we rely on VAD, so we don't force mute unless user muted manually
           if (interactionMode !== 'speaking') {
-            debugLog('MODE', '🗣️ Mode: → speaking (streaming started)');
+            debugLog('MODE', 'Mode: -> speaking (streaming started)');
             setInteractionMode('speaking');
           }
 
@@ -399,7 +649,7 @@ const MainScreen = () => {
           if (lastSpeechStoppedTimeRef.current && !lastFirstAudioReceivedTimeRef.current) {
             lastFirstAudioReceivedTimeRef.current = Date.now();
             const latency = lastFirstAudioReceivedTimeRef.current - lastSpeechStoppedTimeRef.current;
-            console.log(`[CLIENT] [LATENCY] 📥 First Audio Delta Received: ${latency}ms`);
+            console.log(`[CLIENT] [LATENCY] First Audio Delta Received: ${latency}ms`);
           }
 
           if (data.delta) {
@@ -409,22 +659,22 @@ const MainScreen = () => {
 
         case 'input_audio_buffer.speech_started':
           console.log('[CLIENT] INTERRUPT - User speaking (server VAD)');
-          debugLog('MODE', '⚡ INTERRUPT! Mode: → listening');
+          debugLog('MODE', 'INTERRUPT! Mode: -> listening');
 
           stopAudioPlayback();
-
-          // Reset client VAD state
-          vadFrameCountRef.current = 0;
-          clientVadTriggeredRef.current = false;
-
           setInteractionMode('listening');
           break;
 
         case 'input_audio_buffer.speech_stopped':
-          debugLog('MODE', '🧠 Mode: → processing');
+          debugLog('MODE', 'Mode: -> processing');
           lastSpeechStoppedTimeRef.current = Date.now();
           lastFirstAudioReceivedTimeRef.current = null;
           setInteractionMode('processing');
+          break;
+
+        // Vision acknowledgment from server (optional)
+        case 'vision.received':
+          debugLog('VISION', 'Server acknowledged vision frame');
           break;
       }
     } catch (e) {
@@ -435,13 +685,13 @@ const MainScreen = () => {
   // -------------------------------------------------------------------------
   // WEBSOCKET CONNECTION
   // -------------------------------------------------------------------------
-  const BYPASS_BACKEND = true; // Toggle this to true to test UI without backend
+  const BYPASS_BACKEND = false; // Set to true for UI testing without AWS backend
 
   const connect = useCallback((name: string = 'Assistant') => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
     setAgentName(name);
-    debugLog('CONNECTION', `🟡 Connecting to ${name}...`);
+    debugLog('CONNECTION', `Connecting to ${name}...`);
     setConnectionStatus('Connecting...');
 
     if (BYPASS_BACKEND) {
@@ -450,32 +700,63 @@ const MainScreen = () => {
         setConnectionStatus('AI Connected');
         setIsConnected(true);
         setInteractionMode('listening');
-        debugLog('CONNECTION', '🟢 Connected (Simulated)');
+        debugLog('CONNECTION', 'Connected (Simulated)');
       }, 1500);
       return;
     }
 
-    const ws = new WebSocket(RELAY_SERVER_URL);
-    wsRef.current = ws;
+    try {
+      const ws = new WebSocket(RELAY_SERVER_URL);
+      wsRef.current = ws;
 
-    ws.onopen = () => {
-      console.log('[CLIENT] Connected');
-      debugLog('CONNECTION', '🟢 Connected');
-    };
+      // Track if we successfully connected (to distinguish close events)
+      let didConnect = false;
 
-    ws.onmessage = handleMessage;
-    ws.onerror = (e) => console.error('[CLIENT] WebSocket error:', e);
+      ws.onopen = () => {
+        didConnect = true;
+        console.log('[CLIENT] Connected');
+        debugLog('CONNECTION', 'Connected');
+      };
 
-    ws.onclose = () => {
-      console.log('[CLIENT] Disconnected');
-      debugLog('CONNECTION', '🔴 Disconnected');
-      setConnectionStatus('Offline');
-      setIsConnected(false);
-      setInteractionMode('idle');
-      wsRef.current = null;
-      stopAudioPlayback();
-      stopRecording();
-    };
+      ws.onmessage = handleMessage;
+
+      ws.onerror = (e) => {
+        console.error('[CLIENT] WebSocket error:', e);
+        // Don't reset UI here - let onclose handle it
+      };
+
+      ws.onclose = (event) => {
+        console.log('[CLIENT] Disconnected, code:', event.code, 'reason:', event.reason);
+        debugLog('CONNECTION', 'Disconnected');
+
+        // Only reset UI if we were previously connected or after a delay
+        if (didConnect) {
+          // Normal disconnect - reset immediately
+          setConnectionStatus('Offline');
+          setIsConnected(false);
+          setInteractionMode('idle');
+        } else {
+          // Connection failed - show error briefly before resetting
+          setConnectionStatus('Connection Failed');
+          setTimeout(() => {
+            setConnectionStatus('Offline');
+            setIsConnected(false);
+            setInteractionMode('idle');
+          }, 2000);
+        }
+
+        wsRef.current = null;
+        stopAudioPlayback();
+        stopRecording();
+      };
+    } catch (error) {
+      console.error('[CLIENT] Failed to create WebSocket:', error);
+      setConnectionStatus('Connection Failed');
+      setTimeout(() => {
+        setConnectionStatus('Offline');
+        setIsConnected(false);
+      }, 2000);
+    }
   }, [handleMessage, stopRecording, stopAudioPlayback]);
 
   const disconnect = useCallback(() => {
@@ -496,6 +777,25 @@ const MainScreen = () => {
     setConnectionStatus('Offline');
     setIsConnected(false);
   }, [stopRecording, stopAudioPlayback]);
+
+  // -------------------------------------------------------------------------
+  // UI CONTROL HANDLERS
+  // -------------------------------------------------------------------------
+  const handleToggleMute = useCallback(() => {
+    setIsMuted(prev => !prev);
+  }, []);
+
+  const handleToggleCamera = useCallback(() => {
+    setIsCameraOn(prev => !prev);
+  }, []);
+
+  const handleFlipCamera = useCallback(() => {
+    setCameraFacing(prev => prev === 'front' ? 'back' : 'front');
+  }, []);
+
+  const handleToggleNoiseIsolation = useCallback(() => {
+    setIsNoiseIsolationOn(prev => !prev);
+  }, []);
 
   // -------------------------------------------------------------------------
   // LIFECYCLE
@@ -523,40 +823,88 @@ const MainScreen = () => {
   }, [connect]);
 
 
-  const showCallUI = isConnected || connectionStatus === 'Connecting...';
+  const showCallUI = isConnected || connectionStatus === 'Connecting...' || connectionStatus === 'Connection Failed';
 
   // -------------------------------------------------------------------------
-  // ANIMATION STATE & STYLES
+  // ANIMATION STATE & STYLES (Optimized for 120Hz iOS + Android)
   // -------------------------------------------------------------------------
   const animState = useSharedValue(0); // 0 = Disconnected (Sheet visible), 1 = Connected (UI visible)
   const { height: SCREEN_HEIGHT } = Dimensions.get('window');
 
+  // Platform-specific easing - Android performs better with simpler curves
+  const TRANSITION_EASING = Platform.select({
+    ios: Easing.bezier(0.2, 0.0, 0.0, 1.0), // Apple's native curve
+    android: Easing.out(Easing.cubic), // Faster on Android
+    default: Easing.out(Easing.cubic),
+  });
+
+  // Shorter duration on Android feels snappier
+  const TRANSITION_DURATION = Platform.select({
+    ios: 450,
+    android: 300,
+    default: 350,
+  });
+
   useEffect(() => {
-    // If showCallUI is true (Connecting or Connected), animate to 1
-    // If false (Offline), animate to 0
-    animState.value = withSpring(showCallUI ? 1 : 0, {
-      damping: 20,
-      stiffness: 90,
-      mass: 0.5, // Lightweight feel
+    animState.value = withTiming(showCallUI ? 1 : 0, {
+      duration: TRANSITION_DURATION,
+      easing: TRANSITION_EASING,
     });
   }, [showCallUI]);
 
+  // Android: Use opacity-heavy transition (GPU accelerated)
+  // iOS: Use translateY (works great with ProMotion)
   const sheetStyle = useAnimatedStyle(() => {
+    'worklet';
+    if (Platform.OS === 'android') {
+      // Android: Fade + subtle scale (more performant than large translateY)
+      return {
+        opacity: interpolate(
+          animState.value,
+          [0, 0.5, 1],
+          [1, 0.5, 0],
+          Extrapolation.CLAMP
+        ),
+        transform: [{
+          scale: interpolate(
+            animState.value,
+            [0, 1],
+            [1, 0.95],
+            Extrapolation.CLAMP
+          )
+        }],
+      };
+    }
+    // iOS: Slide down
     return {
-      // Slide down off screen
       transform: [{
-        translateY: interpolate(animState.value, [0, 1], [0, SCREEN_HEIGHT], Extrapolation.CLAMP)
+        translateY: interpolate(
+          animState.value,
+          [0, 1],
+          [0, SCREEN_HEIGHT],
+          Extrapolation.CLAMP
+        )
       }],
     };
   });
 
   const uiLayerStyle = useAnimatedStyle(() => {
+    'worklet';
     return {
-      opacity: interpolate(animState.value, [0, 0.5, 1], [0, 0, 1], Extrapolation.CLAMP),
+      opacity: interpolate(
+        animState.value,
+        [0, 0.2, 1],
+        [0, 0, 1],
+        Extrapolation.CLAMP
+      ),
       transform: [{
-        translateY: interpolate(animState.value, [0, 1], [50, 0], Extrapolation.CLAMP)
+        translateY: interpolate(
+          animState.value,
+          [0, 1],
+          [Platform.OS === 'android' ? 15 : 30, 0],
+          Extrapolation.CLAMP
+        )
       }],
-      zIndex: animState.value > 0.5 ? 10 : 0,
     };
   });
 
@@ -569,38 +917,54 @@ const MainScreen = () => {
       <StatusBar barStyle="light-content" />
 
       {/* LAYER 1: Viewfinder Background (Always active but obscured by Sheet initially) */}
-      <Viewfinder isCameraOn={isCameraOn} />
+      <Viewfinder
+        ref={viewfinderRef}
+        isCameraOn={isCameraOn}
+        facing={cameraFacing}
+      />
 
-      {/* LAYER 2: Main Call UI (Fade In / Slide Up) */}
+      {/* LAYER 2: Flash Overlay (Above camera, below UI) */}
+      <FlashOverlay flashOpacity={flashOpacity} />
+
+      {/* LAYER 3: Main Call UI (Fade In / Slide Up) */}
       <Animated.View
         style={[
           styles.uiLayer,
-          { paddingTop: insets.top, paddingBottom: insets.bottom },
+          { paddingTop: insets.top, paddingBottom: insets.bottom, zIndex: showCallUI ? 10 : 0 },
           uiLayerStyle
         ]}
         pointerEvents={showCallUI ? 'auto' : 'none'}
       >
         {/* Top Status */}
-        <StatusPill status={isConnected ? `Connected to ${agentName}` : connectionStatus} isConnected={isConnected} />
+        <StatusPill
+          status={isConnected ? `Connected to ${agentName}` : connectionStatus}
+          isConnected={isConnected}
+        />
 
         {/* Center Orb (smaller, integrated) */}
         <View style={styles.orbContainer}>
-          <ActiveOrb mode={interactionMode} volumeLevel={volumeLevel} />
+          <ActiveOrb
+            mode={interactionMode}
+            volumeLevel={volumeLevel}
+            stabilityProgress={stabilityProgress}
+            isStable={isStable}
+          />
         </View>
 
         {/* Bottom Controls */}
         <ControlSheet
           onDisconnect={disconnect}
           isMuted={isMuted}
-          onToggleMute={() => setIsMuted(!isMuted)}
+          onToggleMute={handleToggleMute}
           isCameraOn={isCameraOn}
-          onToggleCamera={() => setIsCameraOn(!isCameraOn)}
+          onToggleCamera={handleToggleCamera}
+          onFlipCamera={handleFlipCamera}
           isNoiseIsolationOn={isNoiseIsolationOn}
-          onToggleNoiseIsolation={() => setIsNoiseIsolationOn(!isNoiseIsolationOn)}
+          onToggleNoiseIsolation={handleToggleNoiseIsolation}
         />
       </Animated.View>
 
-      {/* LAYER 3: Call History / Start Screen (Slides Down) */}
+      {/* LAYER 4: Call History / Start Screen (Slides Down) */}
       <Animated.View style={[StyleSheet.absoluteFill, sheetStyle]}>
         <CallHistoryScreen onConnect={connect} />
       </Animated.View>
@@ -609,6 +973,22 @@ const MainScreen = () => {
 };
 
 export default function App() {
+  const [fontsLoaded] = useFonts({
+    Inter_400Regular,
+    Inter_500Medium,
+    Inter_600SemiBold,
+    Inter_700Bold,
+  });
+
+  // Show loading indicator while fonts load (Android only needs this)
+  if (!fontsLoaded && Platform.OS === 'android') {
+    return (
+      <View style={styles.loadingContainer}>
+        <ActivityIndicator size="large" color="#34C759" />
+      </View>
+    );
+  }
+
   return (
     <SafeAreaProvider>
       <MainScreen />
@@ -619,10 +999,16 @@ export default function App() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#000',
+    backgroundColor: 'transparent',
+  },
+  loadingContainer: {
+    flex: 1,
+    backgroundColor: '#000000',
+    justifyContent: 'center',
+    alignItems: 'center',
   },
   uiLayer: {
-    flex: 1,
+    ...StyleSheet.absoluteFillObject,
     justifyContent: 'space-between',
     zIndex: 10,
   },
@@ -630,6 +1016,17 @@ const styles = StyleSheet.create({
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    // Make orbit smaller or transparent if needed
+  },
+  flashOverlayContainer: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 5,
+  },
+  flashOverlayBox: {
+    width: CROSSHAIR_SIZE,
+    height: CROSSHAIR_SIZE,
+    borderRadius: CROSSHAIR_RADIUS,
+    backgroundColor: '#FFFFFF',
   },
 });

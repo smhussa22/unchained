@@ -41,8 +41,7 @@ const styles = StyleSheet.create({
     marginRight: THEME.spacing.sm,
   },
   text: {
+    ...THEME.typography.headline,
     color: THEME.colors.textPrimary,
-    fontSize: 17,
-    fontWeight: '600',
   },
 });

@@ -35,7 +35,7 @@ export const CallHistoryScreen: React.FC<CallHistoryScreenProps> = ({ onConnect 
                     </TouchableOpacity>
                 </View>
 
-                <Text style={styles.pageTitle}>FaceTime</Text>
+                <Text style={styles.pageTitle}>LangTime</Text>
 
                 {/* Action Buttons */}
                 <View style={styles.actionButtonsContainer}>
@@ -105,12 +105,11 @@ const styles = StyleSheet.create({
         height: 44,
     },
     editText: {
+        ...THEME.typography.body,
         color: THEME.colors.accent,
-        fontSize: 17,
     },
     pageTitle: {
-        fontSize: 34,
-        fontWeight: 'bold',
+        ...THEME.typography.largeTitle,
         color: THEME.colors.textPrimary,
         marginBottom: 20,
     },
@@ -136,16 +135,18 @@ const styles = StyleSheet.create({
         justifyContent: 'center',
     },
     actionButtonText: {
-        color: '#FFF',
-        fontSize: 15,
+        ...THEME.typography.subheadline,
         fontWeight: '600',
+        color: '#FFF',
     },
     sectionHeader: {
-        color: THEME.colors.textSecondary,
-        fontSize: 13,
+        ...THEME.typography.footnote,
         fontWeight: '600',
+        color: THEME.colors.textSecondary,
         marginBottom: 8,
         marginLeft: 4,
+        textTransform: 'uppercase',
+        letterSpacing: 0.5,
     },
     callItem: {
         flexDirection: 'row',
@@ -166,22 +167,20 @@ const styles = StyleSheet.create({
         justifyContent: 'center',
     },
     avatarInitials: {
+        ...THEME.typography.headline,
         color: '#FFF',
-        fontWeight: '600',
-        fontSize: 18,
     },
     callDetails: {
         flex: 1,
     },
     callerName: {
+        ...THEME.typography.headline,
         color: THEME.colors.textPrimary,
-        fontSize: 17,
-        fontWeight: '600',
         marginBottom: 2,
     },
     callSubtitle: {
+        ...THEME.typography.subheadline,
         color: THEME.colors.textSecondary,
-        fontSize: 15,
     },
     callTypeContainer: {
         flexDirection: 'row',
@@ -192,8 +191,8 @@ const styles = StyleSheet.create({
         alignItems: 'flex-end',
     },
     timeText: {
+        ...THEME.typography.subheadline,
         color: THEME.colors.textSecondary,
-        fontSize: 15,
         marginBottom: 4,
         marginRight: 36,
     },

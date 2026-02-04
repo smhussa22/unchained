@@ -12,6 +12,7 @@ interface ControlSheetProps {
     onToggleMute: () => void;
     isCameraOn: boolean;
     onToggleCamera: () => void;
+    onFlipCamera: () => void;
     isNoiseIsolationOn: boolean;
     onToggleNoiseIsolation: () => void;
 }
@@ -22,6 +23,7 @@ export const ControlSheet = ({
     onToggleMute,
     isCameraOn,
     onToggleCamera,
+    onFlipCamera,
     isNoiseIsolationOn,
     onToggleNoiseIsolation,
 }: ControlSheetProps) => {
@@ -47,7 +49,7 @@ export const ControlSheet = ({
                     <CircleButton
                         icon={Camera}
                         label="flip"
-                        onPress={() => { }}
+                        onPress={onFlipCamera}
                     />
                     <CircleButton
                         icon={PhoneOff}

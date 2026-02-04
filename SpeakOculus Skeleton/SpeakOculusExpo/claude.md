@@ -1,119 +1,150 @@
+Here is the **Comprehensive `claude.md` System Bible**.
 
-
-## Project Context: "Speak Vision" (Phase 1)
-
-We are building a **Proof-of-Work** demonstration for Speak.com.
-**Goal:** Create a high-fidelity, low-latency "Audio Bridge" between a React Native mobile app and the OpenAI Realtime API.
-**Current Focus:** **Phase 1 (The Skeleton)**. We need to set up the environment, the Relay Server, and the Front-end Client to establish a bi-directional audio stream.
-
-**Constraints:**
-
-* **Latency:** Must use WebSockets (no HTTP polling).
-* **Audio Format:** PCM16 (16-bit), 24,000 Hz, Mono.
-* **Security:** API Keys must stay on the server.
+It aggregates every specific detail from your **Frontend Summary** (FaceTime UI, Square Orb, Glassmorphism) and your **Backend Summary** (AWS EC2, PM2, PCM16 Relay) into a single source of truth.
 
 ---
 
-## Technical Stack
+# claude.md
 
-* **Frontend:** React Native (Expo SDK 50+).
-* **Backend:** Node.js + TypeScript + `ws` (WebSocket library).
-* **AI:** OpenAI Realtime API (`wss://api.openai.com/v1/realtime`).
+## 1. Project Overview & Architecture
 
----
+**Objective:** Build "Speak Vision," a high-fidelity real-time Voice AI client that mimics a FaceTime call with an AI agent.
+**Current Phase:** **Phase 1.5 - The "Blind" Merge**. We are integrating the polished "FaceTime" UI with the deployed AWS Audio Backend. *Vision features are temporarily disabled.*
 
-## Instruction Set 1: Project Scaffolding
+### System Topology
 
-Please execute the following directory structure and initialization commands.
-
-### 1.1 Directory Structure
-
-Create a monorepo-style structure:
-
-```text
-/speak-vision
-  /app          (React Native Expo)
-  /server       (Node.js Relay)
+```mermaid
+graph LR
+    A[React Native App] -- WebSocket (PCM16 / 24kHz) --> B[AWS EC2 Relay]
+    B -- WebSocket (JSON / Audio Delta) --> C[OpenAI Realtime API]
+    
+    subgraph Client [Frontend / App.tsx]
+        D[Microphone (AudioRecord)] --> E[RMS Calc] --> F[ActiveOrb (UI)]
+        C1[AudioContext] <--> G[Speaker]
+    end
+    
+    subgraph Server [Backend / server.ts]
+        H[Port 8082]
+        I[PM2 Process]
+    end
 
 ```
 
-### 1.2 Server Initialization
+---
 
-1. Initialize `/server` with `package.json`.
-2. Install dependencies: `npm install ws dotenv uuid`.
-3. Install dev dependencies: `npm install -D typescript @types/ws @types/node @types/uuid ts-node`.
-4. Create a `tsconfig.json` configured for Node.js execution.
+## 2. Frontend Specifications (The "FaceTime" UI)
 
-### 1.3 Client Initialization
+### Core Stack
 
-1. Initialize `/app` using `npx create-expo-app@latest -t blank-typescript`.
-2. Install essential UI/Audio packages: `npx expo install expo-av expo-file-system`.
-3. (Note: We will address raw PCM streaming libraries in the coding step, sticking to standard Expo for now to test connectivity).
+* **Framework:** React Native (Expo SDK 50+).
+* **Animation:** `react-native-reanimated` (SharedValues drive all motion).
+* **Audio:** `react-native-audio-record` (Input), `expo-av` (Output).
+* **Visuals:** `expo-blur` (Glassmorphism), `lucide-react-native` (Icons).
+
+### Visual Language
+
+* **Theme:** "Dark Mode FaceTime"
+* **Background:** `#000000` (Pure Black).
+* **Accent:** `#34C759` (FaceTime Green).
+* **Surface:** `rgba(30, 30, 30, 0.90)` with High Blur (Glass).
+
+
+* **Typography:** System Sans-Serif (Clean, legible).
+
+### Component Dictionary
+
+| Component | Visual Description | Behavior / State Mapping |
+| --- | --- | --- |
+| **ActiveOrb** | **Large Square Viewfinder (280px, Radius 40px)**. <br>
+
+<br>Replaces the old circle orb. | **Idle:** Transparent/Breathing Grey.<br>
+
+<br>**Listening:** Solid Green Frame (`#34C759`).<br>
+
+<br>**Speaking:** Pulsing Green + **Square Ripples** (Driven by RMS).<br>
+
+<br>**Processing:** Pulsing White. |
+| **Viewfinder** | Full-screen `CameraView` layer. | Sits at `zIndex: -1`. Provides AR immersion. |
+| **ControlSheet** | Floating Glassmorphism Pill (Bottom). | **Mic:** Toggles input stream.<br>
+
+<br>**Flip:** Toggles Front/Back Camera.<br>
+
+<br>**End Call:** Destructive (Red). Closes Socket. |
+| **CallHistory** | "Home Screen" List. | Slides down when connection starts (Transition Animation). |
+
+### Audio Pipeline (Client-Side)
+
+1. **Input:** `react-native-audio-record` captures PCM16 at **24,000 Hz**.
+2. **VAD (Client):** "Dirty" RMS check. If volume > threshold while AI is speaking -> **Optimistic Interrupt** (Clear Queue).
+3. **Visualization:** Raw PCM bytes -> Calculate RMS (0-1) -> Update `ActiveOrb` SharedValue.
 
 ---
 
-## Instruction Set 2: The Relay Server (`/server`)
+## 3. Backend Specifications (The Relay)
 
-Generate a robust `server.ts` file that acts as a secure proxy.
+### Infrastructure
 
-**Requirements:**
+* **Host:** AWS EC2 (us-east-1).
+* **Endpoint:** `ws://98.92.191.197:8082` (Plain TCP / Cleartext).
+* **Process Manager:** `PM2` (Service name: `speak-relay`).
+* **Directory:** `~/speak-relay/`.
 
-1. **WebSocket Server:** Listen on port 8081.
-2. **Authentication:** Load `OPENAI_API_KEY` from a `.env` file.
-3. **Connection Logic:**
-* When a Client connects, immediately open a *new* WebSocket connection to `wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01`.
-* Pass the `Authorization: Bearer <KEY>` and `OpenAI-Beta: realtime=v1` headers to OpenAI.
+### Relay Logic (`server.ts`)
 
-
-4. **Event Relay (Pass-through):**
-* **Client -> OpenAI:** Forward all messages as JSON string.
-* **OpenAI -> Client:** Forward all messages as JSON string.
-
-
-5. **Logging:** Add `console.log` for:
-* "Client Connected"
-* "OpenAI Connected"
-* "Session Created"
-* "Error" events.
+* **Role:** 1:1 Stateful Proxy. No database.
+* **Upstream:** Connects to `wss://api.openai.com/v1/realtime?model=gpt-realtime-mini-2025-12-15`.
+* **Auth:** `Authorization: Bearer <OPENAI_API_KEY>` (Loaded from `.env`).
+* **Audio Handling:**
+* **Format:** PCM16, 24kHz, Mono.
+* **Passthrough:** No transcoding. Relay blindly forwards Base64 chunks.
+* **Events:** Listens for `input_audio_buffer.speech_started` from OpenAI and broadcasts to client immediately.
 
 
 
----
+### Deployment Quirks
 
-## Instruction Set 3: The Frontend Client (`/app`)
-
-Generate the `App.tsx` code for the mobile client.
-
-**Requirements:**
-
-1. **UI Layout:**
-* A clean, dark-themed UI (Background: #111).
-* A large status indicator (Text: "Disconnected" | "Connecting..." | "Live").
-* A "Connect" button.
-* A "Push to Talk" button (Placeholder for VAD later).
-
-
-2. **WebSocket Logic:**
-* Use the native `WebSocket` API.
-* Connect to `ws://localhost:8081` (Assume iOS Simulator/Android Emulator local networking).
-
-
-3. **Permission Handling:**
-* On mount, request Microphone permissions using `Audio.requestPermissionsAsync()`.
-
-
-4. **Audio Setup (Configuration Only):**
-* Configure `Audio.setAudioModeAsync()` for `allowsRecordingIOS: true` and `playsInSilentModeIOS: true`.
-* *Do not implement the full streaming loop yet.* Just set up the mode.
-
-
+* **`.env` Location:** Must exist in `dist/` after build or be resolved from root.
+* **Traffic:** Inbound Port 8082 must be open (Security Group).
 
 ---
 
-## Deliverables
+## 4. Integration Logic (The "Glue")
 
-Please provide:
+### The Handshake Protocol
 
-1. The `server.ts` code.
-2. The `App.tsx` code.
-3. A terminal command list to run both environments simultaneously.
+1. **App:** User taps "Call" -> Slides UI -> Opens WebSocket to `98.92.191.197:8082`.
+2. **App:** `socket.onopen` -> UI Status Pill turns **Yellow**.
+3. **Relay:** Connects to OpenAI -> Sends `session.update`.
+4. **App:** Receives `session.created` -> UI Status Pill turns **Green**.
+
+### The "Pulse" (Audio-Visual Sync)
+
+To make the "Square Ripples" work, the `App.tsx` must perform this loop every ~40ms:
+
+```typescript
+AudioRecord.on('data', (base64) => {
+  // 1. Send to AWS
+  socket.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: base64 }));
+  
+  // 2. Drive Animation
+  const volume = calculateRMS(base64); // Helper function
+  orbSharedValue.value = withTiming(volume, { duration: 50 });
+});
+
+```
+
+### The "Barge-In" (Latency Optimization)
+
+* **Trigger:** OpenAI sends `input_audio_buffer.speech_started`.
+* **Action:** App **immediately** calls `AudioContext.stop()` and clears the buffer.
+* **Visual:** `ActiveOrb` switches from **Speaking** (Ripples) to **Listening** (Solid Frame).
+
+---
+
+## 5. Critical Constraints
+
+1. **Android Cleartext:** `app.json` MUST include `usesCleartextTraffic: true` or the AWS connection will fail silently.
+2. **No Vision Yet:** The "Processing" state and `vision.capture` events are **disabled** for this phase. Focus strictly on Audio Latency.
+3. **TSConfig:** Server must NOT extend `expo/tsconfig.base` to avoid module resolution errors.
+
+---

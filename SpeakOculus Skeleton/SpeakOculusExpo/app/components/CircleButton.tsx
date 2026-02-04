@@ -26,7 +26,7 @@ export const CircleButton = ({ icon: Icon, label, onPress, variant = 'default', 
                 activeOpacity={0.7}
             >
                 <Icon
-                    size={32}
+                    size={24}
                     color={
                         isDestructive
                             ? '#FFFFFF'
@@ -47,9 +47,9 @@ const styles = StyleSheet.create({
         gap: THEME.spacing.xs,
     },
     button: {
-        width: 72,
-        height: 72,
-        borderRadius: 36,
+        width: 56,
+        height: 56,
+        borderRadius: 28,
         backgroundColor: THEME.colors.controlBackground,
         alignItems: 'center',
         justifyContent: 'center',
@@ -61,8 +61,8 @@ const styles = StyleSheet.create({
         backgroundColor: THEME.colors.controlActive,
     },
     label: {
+        ...THEME.typography.caption1,
         color: THEME.colors.textSecondary,
-        fontSize: 12,
         textAlign: 'center',
         marginTop: 4,
     },
