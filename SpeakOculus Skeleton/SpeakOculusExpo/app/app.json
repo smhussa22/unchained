@@ -37,7 +37,8 @@
         "android.permission.INTERNET",
         "android.permission.CAMERA",
         "android.permission.HIGH_SAMPLING_RATE_SENSORS",
-        "android.permission.VIBRATE"
+        "android.permission.VIBRATE",
+        "android.permission.WAKE_LOCK"
       ],
       "package": "com.anonymous.speakvision"
     },

@@ -43,15 +43,18 @@ console.log('[RELAY] Waiting for client connections...');
 // =============================================================================
 // SESSION CONFIGURATION (OpenAI Realtime API)
 // =============================================================================
+// Default instructions (can be overridden by agent.config from client)
+const DEFAULT_INSTRUCTIONS = `
+You are a friendly, helpful AI assistant.
+- Style: Conversational, concise, and warm.
+- Voice: Alloy.
+- Language: English.
+- Response: Keep responses short (1-2 sentences) unless asked for detail.
+`;
+
 const SESSION_CONFIG = {
     modalities: ['audio', 'text'],
-    instructions: `
-    You are a friendly, helpful AI assistant.
-    - Style: Conversational, concise, and warm.
-    - Voice: Alloy.
-    - Language: English.
-    - Response: Keep responses short (1-2 sentences) unless asked for detail.
-  `,
+    instructions: DEFAULT_INSTRUCTIONS,
     voice: 'alloy',
     input_audio_format: 'pcm16',
     output_audio_format: 'pcm16', // RAW PCM16 @ 24kHz (OpenAI standard)
@@ -64,18 +67,47 @@ const SESSION_CONFIG = {
         prefix_padding_ms: 300,
         silence_duration_ms: 500, // Fast turn-taking for natural conversation
     },
+    // ==========================================================================
+    // TOOL DEFINITIONS (Phase 3.0 - The Friend Loop)
+    // ==========================================================================
+    tools: [
+        {
+            type: 'function',
+            name: 'log_gap_word',
+            description: 'ALWAYS call this function whenever the user says ANY word in English (their native language) instead of the target language. Call it for EVERY English word - be liberal. Even small words like "yes", "the", "okay" count. This tracks vocabulary gaps for spaced repetition. Call multiple times if user says multiple English words.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    native_word: {
+                        type: 'string',
+                        description: 'The English word or short phrase the user said',
+                    },
+                    target_word: {
+                        type: 'string',
+                        description: 'The correct translation in the target language',
+                    },
+                },
+                required: ['native_word', 'target_word'],
+            },
+        },
+    ],
+    tool_choice: 'auto',
 };
 
 // =============================================================================
 // CRITICAL EVENTS - Events that the Frontend needs for UI synchronization
 // =============================================================================
 const CRITICAL_EVENTS = [
-    'session.created',              // Session ready - Client can show "connected"
-    'input_audio_buffer.speech_started', // VAD detected user speaking - Stop AI audio playback
-    'input_audio_buffer.speech_stopped', // User stopped speaking
-    'response.created',             // AI is about to respond
-    'response.done',                // AI finished responding
-    'error',                        // Something went wrong
+    'session.created',                          // Session ready - Client can show "connected"
+    'session.updated',                          // Session config updated (e.g., new instructions)
+    'input_audio_buffer.speech_started',        // VAD detected user speaking - Stop AI audio playback
+    'input_audio_buffer.speech_stopped',        // User stopped speaking
+    'response.created',                         // AI is about to respond
+    'response.done',                            // AI finished responding
+    'response.cancelled',                       // AI response was cancelled (barge-in)
+    'conversation.item.truncated',              // Truncation confirmed by OpenAI
+    'response.function_call_arguments.done',    // Tool call completed - Handle function
+    'error',                                    // Something went wrong
 ];
 
 // =============================================================================
@@ -88,6 +120,16 @@ wss.on('connection', (clientWs: WebSocket) => {
     // Track cleanup state to prevent double-cleanup
     let isCleanedUp = false;
     let pingInterval: NodeJS.Timeout | null = null;
+
+    // =========================================================================
+    // SESSION MEMORY (Phase 3.0 - The Friend Loop)
+    // =========================================================================
+    // Gap words the user forgot during this session
+    const gapWords: Array<{ native: string; target: string }> = [];
+    // Current instructions (mutable - updated by agent.config and context injection)
+    let currentInstructions = DEFAULT_INSTRUCTIONS;
+    // Pending agent config (client may send before OpenAI is ready)
+    let pendingAgentConfig: { name: string; language: string } | null = null;
 
     // -------------------------------------------------------------------------
     // CLEANUP FUNCTION - The "Billing Saver"
@@ -122,6 +164,46 @@ wss.on('connection', (clientWs: WebSocket) => {
     };
 
     // -------------------------------------------------------------------------
+    // HELPER: Apply Agent Config (builds and sends the Friend Mode prompt)
+    // -------------------------------------------------------------------------
+    const applyAgentConfig = (name: string, language: string) => {
+        // Build the Friend Mode system prompt
+        currentInstructions = `You are ${name}, a friendly ${language} tutor having an immersive conversation.
+
+CRITICAL: You MUST speak ONLY in ${language}. Do NOT speak English except when correcting an English word the user said.
+
+TOOL USAGE - VERY IMPORTANT:
+- You have access to the \`log_gap_word\` tool. You MUST call it EVERY TIME the user says ANY English word or phrase.
+- Be LIBERAL with tool calls. If in doubt, log it.
+- Call the tool for EACH distinct English word/phrase separately (e.g., if user says "the cat and the dog", call the tool twice: once for "cat"→"chat", once for "dog"→"chien").
+- Even common words like "yes", "no", "okay", "the", "a" should be logged if said in English.
+- The tool helps track vocabulary gaps. More data = better learning.
+
+CORE BEHAVIORS:
+1. ALWAYS respond in ${language}. Start your very first message with a warm greeting in ${language}.
+2. If the user shows you an object (via image), describe it and ask questions about it — all in ${language}.
+3. When the user says ANY English word, IMMEDIATELY:
+   a) Call \`log_gap_word\` with native_word (the English) and target_word (the ${language} translation)
+   b) Gently correct them by providing the ${language} word (e.g., "Ah, tu veux dire la cuillère!")
+4. If the context mentions the user forgot a word, weave that word into your next response to reinforce it.
+5. Keep responses SHORT (1-2 sentences). This is a real-time voice conversation.
+6. Be encouraging! Celebrate progress in ${language}.
+
+STYLE:
+- Speak naturally and conversationally, as a native ${language} speaker would
+- Adjust vocabulary to beginner/intermediate level
+- Use simple sentence structures`;
+
+        // Send session.update to OpenAI with the new instructions
+        const sessionUpdate = {
+            type: 'session.update',
+            session: { instructions: currentInstructions },
+        };
+        openAiWs.send(JSON.stringify(sessionUpdate));
+        console.log(`[RELAY] Agent configured for ${clientId}: "${name}" teaching "${language}"`);
+    };
+
+    // -------------------------------------------------------------------------
     // UPSTREAM CONNECTION - Relay <-> OpenAI Realtime API
     // -------------------------------------------------------------------------
     // Model: gpt-realtime-mini-2025-12-15 - cost-effective with vision support
@@ -143,6 +225,13 @@ wss.on('connection', (clientWs: WebSocket) => {
         };
         openAiWs.send(JSON.stringify(sessionUpdate));
         console.log(`[RELAY] Session configured for ${clientId}`);
+
+        // Apply pending agent config if client sent it before OpenAI was ready
+        if (pendingAgentConfig) {
+            console.log(`[RELAY] Applying pending agent config for ${clientId}`);
+            applyAgentConfig(pendingAgentConfig.name, pendingAgentConfig.language);
+            pendingAgentConfig = null;
+        }
 
         // Start keep-alive ping to prevent connection drops
         pingInterval = setInterval(() => {
@@ -167,6 +256,59 @@ wss.on('connection', (clientWs: WebSocket) => {
             // the client so it can stop AI audio playback (barge-in).
             if (eventType === 'input_audio_buffer.speech_started') {
                 console.log(`[RELAY] Speech started - interrupting client ${clientId}`);
+            }
+
+            // =================================================================
+            // TOOL CALL HANDLER (Phase 3.0 - The Friend Loop)
+            // When OpenAI calls a function, we handle it here.
+            // =================================================================
+            if (eventType === 'response.function_call_arguments.done') {
+                const { call_id, name, arguments: argsJson } = response;
+
+                if (name === 'log_gap_word') {
+                    try {
+                        const args = JSON.parse(argsJson);
+                        const { native_word, target_word } = args;
+
+                        // 1. Store in session memory
+                        gapWords.push({ native: native_word, target: target_word });
+                        console.log(`[MEMORY] Logged gap word for ${clientId}: "${native_word}" -> "${target_word}"`);
+                        console.log(`[MEMORY] Session has ${gapWords.length} gap words total`);
+
+                        // 2. Send function output back to OpenAI (completes the tool call loop)
+                        const toolOutput = {
+                            type: 'conversation.item.create',
+                            item: {
+                                type: 'function_call_output',
+                                call_id: call_id,
+                                output: JSON.stringify({
+                                    status: 'logged',
+                                    native_word,
+                                    target_word,
+                                    message: `Word logged. Try to use "${target_word}" in your next response to reinforce it.`,
+                                }),
+                            },
+                        };
+                        openAiWs.send(JSON.stringify(toolOutput));
+                        console.log(`[RELAY] Sent tool output for ${clientId}`);
+
+                        // 3. Trigger response so AI continues speaking
+                        openAiWs.send(JSON.stringify({ type: 'response.create' }));
+                        console.log(`[RELAY] Triggered response.create for ${clientId}`);
+
+                        // 4. Context Injection: Update instructions with hint about the gap word
+                        currentInstructions += `\n\nCONTEXT UPDATE: User recently forgot "${target_word}" (they said "${native_word}" instead). Try to use "${target_word}" naturally in your next response to reinforce it.`;
+                        const sessionUpdate = {
+                            type: 'session.update',
+                            session: { instructions: currentInstructions },
+                        };
+                        openAiWs.send(JSON.stringify(sessionUpdate));
+                        console.log(`[RELAY] Injected context hint for "${target_word}" into session ${clientId}`);
+
+                    } catch (e) {
+                        console.error(`[RELAY] Failed to parse tool arguments for ${clientId}:`, e);
+                    }
+                }
             }
 
             // Log critical events, suppress audio delta spam
@@ -270,6 +412,29 @@ wss.on('connection', (clientWs: WebSocket) => {
                 }
 
                 return; // Don't forward vision.direct_injection to OpenAI as-is
+            }
+
+            // =================================================================
+            // DYNAMIC PERSONA HANDLER (Phase 3.0 - The Friend Loop)
+            // Client sends agent config (name, language) to set up Friend Mode.
+            // =================================================================
+            if (messageType === 'agent.config') {
+                const { name, language } = message.config || {};
+
+                if (name && language) {
+                    if (openAiWs.readyState === WebSocket.OPEN) {
+                        // OpenAI is ready - apply immediately
+                        applyAgentConfig(name, language);
+                    } else {
+                        // OpenAI not ready yet - queue for later
+                        console.log(`[RELAY] Queuing agent config for ${clientId} (OpenAI not ready)`);
+                        pendingAgentConfig = { name, language };
+                    }
+                } else {
+                    console.warn(`[RELAY] Received agent.config without name or language for ${clientId}`);
+                }
+
+                return; // Don't forward agent.config to OpenAI as-is
             }
 
             // Forward to OpenAI (passthrough - no transformation)

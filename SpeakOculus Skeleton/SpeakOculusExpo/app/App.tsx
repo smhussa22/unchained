@@ -16,6 +16,7 @@ import {
   Inter_700Bold,
 } from '@expo-google-fonts/inter';
 import AudioRecord from 'react-native-audio-record';
+import InCallManager from 'react-native-incall-manager';
 import { Buffer } from 'buffer';
 import Animated, {
   useSharedValue,
@@ -26,6 +27,7 @@ import Animated, {
   Extrapolation,
   Easing,
   runOnJS,
+  SharedValue,
 } from 'react-native-reanimated';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { AudioContext, AudioBufferSourceNode } from 'react-native-audio-api';
@@ -37,8 +39,21 @@ import { ActiveOrb, OrbMode } from './components/ActiveOrb';
 import { StatusPill } from './components/StatusPill';
 import { ControlSheet } from './components/ControlSheet';
 import { Viewfinder, CameraFacing, ViewfinderRef } from './components/Viewfinder';
-import { CallHistoryScreen } from './components/CallHistoryScreen';
+import { CallHistoryScreen, AgentConfig, CallHistoryItem, generateSystemPrompt } from './components/CallHistoryScreen';
+import { GapWordsScreen } from './components/GapWordsScreen';
 import { THEME } from './theme';
+
+// Storage utilities
+import { loadAgents, addAgent, loadCallHistory, saveCallHistory, addGapWord, GapWord } from './storage';
+
+// Helper to generate unique IDs
+const generateUUID = (): string => {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = Math.random() * 16 | 0;
+    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+};
 
 // Hooks
 import { useCameraStabilityWithReset } from './hooks/useCameraStability';
@@ -46,8 +61,38 @@ import { useCameraStabilityWithReset } from './hooks/useCameraStability';
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
-const RELAY_SERVER_URL = 'ws://98.92.191.197:8082';
+// Set to true to use the relay running on your machine.
+const USE_LOCAL_RELAY = true;
+const RELAY_PRODUCTION_URL = 'ws://98.92.191.197:8082';
+const RELAY_PORT = 8082;
+// Physical Android via USB: use adb reverse, then connect to localhost (set below).
+const USE_ADB_REVERSE = true; // true = device plugged in + adb reverse tcp:8082 tcp:8082
+// For iOS Simulator or physical device (no reverse): use your computer's LAN IP.
+// For Android Emulator (USE_ADB_REVERSE false): we use 10.0.2.2 when this is 'localhost'.
+const LOCAL_RELAY_IP = 'localhost';
+
+const RELAY_SERVER_URL = (() => {
+  if (!USE_LOCAL_RELAY) return RELAY_PRODUCTION_URL;
+  if (Platform.OS === 'android') {
+    // Physical device + adb reverse: device's localhost:8082 → host's 8082
+    if (USE_ADB_REVERSE) return `ws://127.0.0.1:${RELAY_PORT}`;
+    // Emulator: 10.0.2.2 is the host loopback
+    const host = LOCAL_RELAY_IP === 'localhost' ? '10.0.2.2' : LOCAL_RELAY_IP;
+    return `ws://${host}:${RELAY_PORT}`;
+  }
+  return `ws://${LOCAL_RELAY_IP}:${RELAY_PORT}`;
+})();
+
 const SAMPLE_RATE = 24000; // OpenAI Realtime API requirement
+
+// ============================================================================
+// BARGE-IN CONFIGURATION
+// ============================================================================
+// RMS threshold for barge-in during AI playback. Audio above this threshold
+// is considered real user speech (not echo) and will be sent to the server.
+// Typical values: residual echo ~0.01-0.05, human speech ~0.08-0.3
+// Start conservative and lower if interrupts aren't detected reliably.
+const BARGE_IN_RMS_THRESHOLD = 0.08;
 
 // Vision Configuration
 const VISION_COOLDOWN_MS = 8000; // 8 seconds between captures
@@ -85,7 +130,7 @@ const AUDIO_RECORD_OPTIONS = {
 // FLASH OVERLAY COMPONENT (Box-sized, centered on crosshair)
 // ============================================================================
 interface FlashOverlayProps {
-  flashOpacity: Animated.SharedValue<number>;
+  flashOpacity: SharedValue<number>;
 }
 
 const FlashOverlay: React.FC<FlashOverlayProps> = ({ flashOpacity }) => {
@@ -120,6 +165,13 @@ const MainScreen = () => {
   const [interactionMode, setInteractionMode] = useState<OrbMode>('idle');
   const [permissionGranted, setPermissionGranted] = useState(false);
 
+  // Agent Configuration State
+  const [currentAgentConfig, setCurrentAgentConfig] = useState<AgentConfig | null>(null);
+  const [callHistory, setCallHistory] = useState<CallHistoryItem[]>([]);
+
+  // Gap Words Screen Navigation State
+  const [selectedAgentForGapWords, setSelectedAgentForGapWords] = useState<AgentConfig | null>(null);
+
   // UI States
   const [isMuted, setIsMuted] = useState(false);
   const [isCameraOn, setIsCameraOn] = useState(true);
@@ -132,6 +184,9 @@ const MainScreen = () => {
 
   // Ref to track mute state in audio callback (avoids stale closure)
   const isMutedRef = useRef(false);
+
+  // Session timing for history
+  const sessionStartTimeRef = useRef<number | null>(null);
 
   // -------------------------------------------------------------------------
   // REFS
@@ -155,6 +210,13 @@ const MainScreen = () => {
   const nextStartTimeRef = useRef<number>(0);
   const pendingSourcesRef = useRef<AudioBufferSourceNode[]>([]);
   const isPlayingRef = useRef(false);
+
+  // -------------------------------------------------------------------------
+  // BARGE-IN / TRUNCATION TRACKING
+  // -------------------------------------------------------------------------
+  // Track current response for proper truncation on interrupt
+  const lastResponseItemIdRef = useRef<string | null>(null);
+  const responseStartTimeRef = useRef<number>(0); // AudioContext.currentTime when response started
 
 
   // -------------------------------------------------------------------------
@@ -559,17 +621,28 @@ const MainScreen = () => {
       }
 
       // =========================================================================
-      // ECHO PREVENTION: Don't send audio while AI is speaking
-      // This prevents the AI from hearing its own audio through the mic.
+      // BARGE-IN WITH ECHO PREVENTION (RMS Threshold Gate)
+      //
+      // Instead of hard-muting the mic during AI playback, we use an RMS
+      // threshold to distinguish real user speech from echo/residual audio.
+      // - Below threshold during playback: likely echo, suppress
+      // - Above threshold during playback: likely real speech, allow (barge-in)
+      // - Not playing: always allow
+      //
+      // This requires hardware AEC (via react-native-incall-manager) to work well.
       // =========================================================================
       if (isPlayingRef.current) {
-        // Show dimmed visualization to indicate mic is suppressed during AI speech
-        volumeLevel.value = withSpring(rms * 0.2, {
-          damping: 15,
-          stiffness: 400,
-          mass: 0.5,
-        });
-        return;
+        if (rms < BARGE_IN_RMS_THRESHOLD) {
+          // Below threshold - likely echo, suppress
+          volumeLevel.value = withSpring(rms * 0.2, {
+            damping: 15,
+            stiffness: 400,
+            mass: 0.5,
+          });
+          return; // Don't send - this is probably echo
+        }
+        // Above threshold during playback - potential barge-in!
+        debugLog('BARGE-IN', `Loud audio during playback (RMS: ${rms.toFixed(3)}) - allowing through`);
       }
 
       // Update volume visualization with fast spring for smooth 60fps reactivity
@@ -580,7 +653,7 @@ const MainScreen = () => {
         mass: 0.5,
       });
 
-      // Send audio to relay server (only when AI is NOT speaking)
+      // Send audio to relay server
       wsRef.current.send(JSON.stringify({
         type: 'input_audio_buffer.append',
         audio: base64Data,
@@ -639,10 +712,42 @@ const MainScreen = () => {
           console.log('[CLIENT] Session ready');
           break;
 
+        case 'response.function_call_arguments.done':
+          // Tool call from the LLM (e.g. log_gap_word in Friend Mode)
+          const toolName = data.name ?? 'unknown';
+          let toolArgs: Record<string, string> = {};
+          try {
+            if (typeof data.arguments === 'string') toolArgs = JSON.parse(data.arguments);
+          } catch { /* ignore */ }
+          console.log('[CLIENT] TOOL CALL:', toolName, toolArgs);
+
+          // Handle log_gap_word tool - save the gap word to storage
+          if (toolName === 'log_gap_word' && currentAgentConfig) {
+            const gapWord: GapWord = {
+              native_word: toolArgs.native_word || '',
+              target_word: toolArgs.target_word || '',
+              timestamp: Date.now(),
+            };
+            addGapWord(currentAgentConfig.name, gapWord);
+            console.log('[CLIENT] Gap word saved:', gapWord);
+          }
+          break;
+
         case 'response.audio.delta':
+          // Track item_id for truncation on interrupt
+          if (data.item_id) {
+            lastResponseItemIdRef.current = data.item_id;
+          }
+
           if (interactionMode !== 'speaking') {
             debugLog('MODE', 'Mode: -> speaking (streaming started)');
             setInteractionMode('speaking');
+
+            // Track when this response started playing (for truncation calculation)
+            if (audioContextRef.current) {
+              responseStartTimeRef.current = audioContextRef.current.currentTime;
+              debugLog('BARGE-IN', `Response started at AudioContext time: ${responseStartTimeRef.current.toFixed(3)}s`);
+            }
           }
 
           // Latency Log: First Byte
@@ -661,8 +766,33 @@ const MainScreen = () => {
           console.log('[CLIENT] INTERRUPT - User speaking (server VAD)');
           debugLog('MODE', 'INTERRUPT! Mode: -> listening');
 
+          // Calculate how much audio actually played before interrupt (for truncation)
+          let audioEndMs = 0;
+          if (audioContextRef.current && responseStartTimeRef.current > 0) {
+            const elapsedSeconds = audioContextRef.current.currentTime - responseStartTimeRef.current;
+            audioEndMs = Math.max(0, Math.floor(elapsedSeconds * 1000));
+            debugLog('BARGE-IN', `Audio played before interrupt: ${audioEndMs}ms`);
+          }
+
+          // Send truncation event to keep conversation history coherent
+          // This tells OpenAI exactly how much of its response the user heard
+          if (lastResponseItemIdRef.current && audioEndMs > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
+            const truncateEvent = {
+              type: 'conversation.item.truncate',
+              item_id: lastResponseItemIdRef.current,
+              content_index: 0,
+              audio_end_ms: audioEndMs,
+            };
+            wsRef.current.send(JSON.stringify(truncateEvent));
+            console.log(`[CLIENT] Sent truncate event: item_id=${lastResponseItemIdRef.current}, audio_end_ms=${audioEndMs}`);
+          }
+
           stopAudioPlayback();
           setInteractionMode('listening');
+
+          // Reset tracking refs
+          lastResponseItemIdRef.current = null;
+          responseStartTimeRef.current = 0;
           break;
 
         case 'input_audio_buffer.speech_stopped':
@@ -670,6 +800,15 @@ const MainScreen = () => {
           lastSpeechStoppedTimeRef.current = Date.now();
           lastFirstAudioReceivedTimeRef.current = null;
           setInteractionMode('processing');
+          break;
+
+        // Barge-in confirmation events
+        case 'response.cancelled':
+          console.log('[CLIENT] Response cancelled (barge-in successful)');
+          break;
+
+        case 'conversation.item.truncated':
+          debugLog('BARGE-IN', 'Truncation confirmed by OpenAI');
           break;
 
         // Vision acknowledgment from server (optional)
@@ -687,12 +826,26 @@ const MainScreen = () => {
   // -------------------------------------------------------------------------
   const BYPASS_BACKEND = false; // Set to true for UI testing without AWS backend
 
-  const connect = useCallback((name: string = 'Assistant') => {
+  const connect = useCallback((config: AgentConfig) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
-    setAgentName(name);
-    debugLog('CONNECTION', `Connecting to ${name}...`);
-    setConnectionStatus('Connecting...');
+    // Validate config
+    if (!config || !config.name || !config.language) {
+      console.error('[CLIENT] Invalid agent config:', config);
+      return;
+    }
+
+    // Store the agent config and update display name
+    try {
+      setCurrentAgentConfig(config);
+      setAgentName(config.name);
+      sessionStartTimeRef.current = Date.now();
+      debugLog('CONNECTION', `Connecting to ${config.name} (${config.language})...`);
+      setConnectionStatus('Connecting...');
+    } catch (e) {
+      console.error('[CLIENT] Error setting up connection state:', e);
+      return;
+    }
 
     if (BYPASS_BACKEND) {
       console.log('[CLIENT] BYPASS_BACKEND active. Simulating connection...');
@@ -716,6 +869,31 @@ const MainScreen = () => {
         didConnect = true;
         console.log('[CLIENT] Connected');
         debugLog('CONNECTION', 'Connected');
+
+        // =====================================================================
+        // HARDWARE AEC ACTIVATION
+        // Start InCallManager to activate iOS voiceChat mode / Android voice
+        // call routing. This enables hardware echo cancellation which is
+        // critical for barge-in to work without feedback loops.
+        // =====================================================================
+        try {
+          InCallManager.start({ media: 'audio' });
+          console.log('[AEC] InCallManager started - hardware echo cancellation active');
+        } catch (e) {
+          console.warn('[AEC] Failed to start InCallManager:', e);
+        }
+
+        // PHASE 3.1: Send agent.config to trigger dynamic persona on server
+        // The server will handle generating the Friend Mode system prompt
+        const agentConfigMessage = {
+          type: 'agent.config',
+          config: {
+            name: config.name,
+            language: config.language,
+          },
+        };
+        ws.send(JSON.stringify(agentConfigMessage));
+        debugLog('SESSION', `Sent agent.config for ${config.name}: ${config.language} tutor`);
       };
 
       ws.onmessage = handleMessage;
@@ -760,8 +938,40 @@ const MainScreen = () => {
   }, [handleMessage, stopRecording, stopAudioPlayback]);
 
   const disconnect = useCallback(() => {
+    // Save to history before disconnecting
+    if (currentAgentConfig && sessionStartTimeRef.current) {
+      const duration = Math.floor((Date.now() - sessionStartTimeRef.current) / 1000);
+      const historyItem: CallHistoryItem = {
+        id: generateUUID(),
+        agentConfig: currentAgentConfig,
+        timestamp: new Date(sessionStartTimeRef.current),
+        duration,
+      };
+      setCallHistory(prev => {
+        const updated = [historyItem, ...prev];
+        // Persist to AsyncStorage
+        saveCallHistory(updated);
+        return updated;
+      });
+      // Also save the agent to persistent storage
+      addAgent(currentAgentConfig);
+      debugLog('HISTORY', `Saved session: ${currentAgentConfig.name} (${duration}s)`);
+    }
+
     stopRecording();
     stopAudioPlayback();
+
+    // Stop hardware AEC
+    try {
+      InCallManager.stop();
+      console.log('[AEC] InCallManager stopped');
+    } catch (e) {
+      console.warn('[AEC] Failed to stop InCallManager:', e);
+    }
+
+    // Reset agent config
+    setCurrentAgentConfig(null);
+    sessionStartTimeRef.current = null;
 
     if (BYPASS_BACKEND) {
       setConnectionStatus('Offline');
@@ -776,7 +986,7 @@ const MainScreen = () => {
     }
     setConnectionStatus('Offline');
     setIsConnected(false);
-  }, [stopRecording, stopAudioPlayback]);
+  }, [stopRecording, stopAudioPlayback, currentAgentConfig]);
 
   // -------------------------------------------------------------------------
   // UI CONTROL HANDLERS
@@ -797,6 +1007,15 @@ const MainScreen = () => {
     setIsNoiseIsolationOn(prev => !prev);
   }, []);
 
+  // Delete a call history item
+  const handleDeleteItem = useCallback((itemId: string) => {
+    setCallHistory(prev => {
+      const updated = prev.filter(item => item.id !== itemId);
+      saveCallHistory(updated);
+      return updated;
+    });
+  }, []);
+
   // -------------------------------------------------------------------------
   // LIFECYCLE
   // -------------------------------------------------------------------------
@@ -804,6 +1023,53 @@ const MainScreen = () => {
     const init = async () => {
       const granted = await requestMicrophonePermission();
       setPermissionGranted(granted);
+
+      // Load persisted data from AsyncStorage
+      const storedHistory = await loadCallHistory();
+
+      // If no history exists, load placeholder data for preview
+      if (storedHistory.length === 0) {
+        const placeholderHistory: CallHistoryItem[] = [
+          {
+            id: 'demo-1',
+            agentConfig: { name: 'María', language: 'Spanish', systemPrompt: '' },
+            timestamp: new Date(Date.now() - 1000 * 60 * 30), // 30 min ago
+            duration: 245,
+          },
+          {
+            id: 'demo-2',
+            agentConfig: { name: 'Pierre', language: 'French', systemPrompt: '' },
+            timestamp: new Date(Date.now() - 1000 * 60 * 60 * 3), // 3 hours ago
+            duration: 180,
+          },
+          {
+            id: 'demo-3',
+            agentConfig: { name: 'Yuki', language: 'Japanese', systemPrompt: '' },
+            timestamp: new Date(Date.now() - 1000 * 60 * 60 * 24), // yesterday
+            duration: 420,
+          },
+        ];
+        setCallHistory(placeholderHistory);
+
+        // Also add some placeholder gap words for María
+        const { saveAllGapWords } = await import('./storage');
+        await saveAllGapWords({
+          'María': [
+            { native_word: 'to run', target_word: 'correr', timestamp: Date.now() - 1000 * 60 * 25 },
+            { native_word: 'window', target_word: 'ventana', timestamp: Date.now() - 1000 * 60 * 20 },
+            { native_word: 'to understand', target_word: 'entender', timestamp: Date.now() - 1000 * 60 * 15 },
+            { native_word: 'beautiful', target_word: 'hermoso', timestamp: Date.now() - 1000 * 60 * 10 },
+          ],
+          'Pierre': [
+            { native_word: 'always', target_word: 'toujours', timestamp: Date.now() - 1000 * 60 * 60 * 2 },
+            { native_word: 'tomorrow', target_word: 'demain', timestamp: Date.now() - 1000 * 60 * 60 * 2.5 },
+          ],
+        });
+        console.log('[STORAGE] Loaded placeholder data for preview');
+      } else {
+        setCallHistory(storedHistory);
+        console.log('[STORAGE] Loaded call history:', storedHistory.length, 'items');
+      }
     };
     init();
 
@@ -832,7 +1098,7 @@ const MainScreen = () => {
   const { height: SCREEN_HEIGHT } = Dimensions.get('window');
 
   // Platform-specific easing - Android performs better with simpler curves
-  const TRANSITION_EASING = Platform.select({
+  const TRANSITION_EASING = Platform.select<any>({
     ios: Easing.bezier(0.2, 0.0, 0.0, 1.0), // Apple's native curve
     android: Easing.out(Easing.cubic), // Faster on Android
     default: Easing.out(Easing.cubic),
@@ -966,8 +1232,21 @@ const MainScreen = () => {
 
       {/* LAYER 4: Call History / Start Screen (Slides Down) */}
       <Animated.View style={[StyleSheet.absoluteFill, sheetStyle]}>
-        <CallHistoryScreen onConnect={connect} />
+        <CallHistoryScreen
+          onConnect={connect}
+          history={callHistory}
+          onViewGapWords={(agent) => setSelectedAgentForGapWords(agent)}
+          onDeleteItem={handleDeleteItem}
+        />
       </Animated.View>
+
+      {/* LAYER 5: Gap Words Screen (slides in from right) */}
+      {selectedAgentForGapWords && (
+        <GapWordsScreen
+          agent={selectedAgentForGapWords}
+          onBack={() => setSelectedAgentForGapWords(null)}
+        />
+      )}
     </View>
   );
 };

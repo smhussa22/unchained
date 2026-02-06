@@ -148,3 +148,27 @@ AudioRecord.on('data', (base64) => {
 3. **TSConfig:** Server must NOT extend `expo/tsconfig.base` to avoid module resolution errors.
 
 ---
+
+## 6. Local Testing (Relay on Your Machine)
+
+To test the app against the relay running locally:
+
+1. **Start the relay** (from repo root):
+   ```bash
+   cd server
+   cp .env.example .env   # if needed; add OPENAI_API_KEY
+   npm run dev
+   ```
+   Server listens on `0.0.0.0:8082`.
+
+2. **Point the app at the local relay** in `app/App.tsx`:
+   * Set `USE_LOCAL_RELAY = true`.
+   * **Physical Android (USB):** Set `USE_ADB_REVERSE = true`, then run once with device connected: `adb reverse tcp:8082 tcp:8082`. App connects to `127.0.0.1:8082` on device (forwards to host).
+   * **Android Emulator:** Set `USE_ADB_REVERSE = false`; app uses `10.0.2.2:8082` when `LOCAL_RELAY_IP` is `'localhost'`.
+   * **iOS Simulator or physical device:** Set `LOCAL_RELAY_IP` to your computer’s LAN IP (e.g. `'192.168.1.100'`). Find it with `ipconfig getifaddr en0` (Mac) or `ifconfig` / network settings.
+
+3. **Run the app** (Expo dev build): `npx expo run:ios` or `npx expo run:android`.
+
+4. **Switch back to production:** Set `USE_LOCAL_RELAY = false` so the app uses the EC2 relay URL.
+
+---
