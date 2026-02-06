@@ -25,8 +25,25 @@ const PORT = 8082;
 const HOST = '0.0.0.0'; // Accept traffic from any interface (required for AWS EC2)
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || '').trim();
 
+// =============================================================================
+// STABILITY CONSTANTS
+// =============================================================================
 // Keep-alive interval (30 seconds) - prevents AWS/router from dropping idle connections
-const PING_INTERVAL_MS = 30000;
+const PING_INTERVAL_MS = 30_000;
+// [FIX: Zombie Detection] Maximum gap words per session (FIFO eviction when exceeded)
+const MAX_GAP_WORDS = 50;
+// [FIX: Bounded Growth] Maximum characters for instructions payload.
+// OpenAI Realtime API has a ~16,384 token budget for instructions+tools.
+// At ~4 chars/token, that is ~65K chars. We cap at 8,000 chars for instructions
+// to leave headroom for tool definitions (~2K tokens) and safety margin.
+const MAX_INSTRUCTIONS_CHARS = 8_000;
+// [FIX: Race Condition] Debounce window for session.update after tool calls.
+// Coalesces rapid tool calls into a single context injection.
+const CONTEXT_UPDATE_DEBOUNCE_MS = 2_000;
+// [FIX: Input Validation] Maximum base64 image size (5MB base64 ~ 3.75MB decoded)
+const MAX_IMAGE_BASE64_CHARS = 5 * 1024 * 1024 * (4 / 3); // ~6.67M chars
+// [FIX: Input Validation] Maximum single message size from client (10MB)
+const MAX_CLIENT_MESSAGE_BYTES = 10 * 1024 * 1024;
 
 if (!OPENAI_API_KEY) {
     console.error('[FATAL] OPENAI_API_KEY is missing or empty in .env');
@@ -35,7 +52,12 @@ if (!OPENAI_API_KEY) {
 }
 
 // Create WebSocket Server bound to all interfaces
-const wss = new WebSocketServer({ port: PORT, host: HOST });
+// [FIX: Input Validation] Set maxPayload to reject oversized frames at the protocol level
+const wss = new WebSocketServer({
+    port: PORT,
+    host: HOST,
+    maxPayload: MAX_CLIENT_MESSAGE_BYTES,
+});
 
 console.log(`[RELAY] Server running on ${HOST}:${PORT}`);
 console.log('[RELAY] Waiting for client connections...');
@@ -74,7 +96,7 @@ const SESSION_CONFIG = {
         {
             type: 'function',
             name: 'log_gap_word',
-            description: 'ALWAYS call this function whenever the user says ANY word in English (their native language) instead of the target language. Call it for EVERY English word - be liberal. Even small words like "yes", "the", "okay" count. This tracks vocabulary gaps for spaced repetition. Call multiple times if user says multiple English words.',
+            description: 'Call this when the user says a meaningful English word instead of the target language equivalent. Only log words that represent genuine vocabulary gaps — NOT discourse markers (okay, yes, no, um, so, like, well), NOT loanwords commonly used in the target language, and NOT filler words. If the user says multiple English words in one utterance, log only the MOST important one (the one most relevant to the current conversation topic, or the most common word). Do NOT log the same word twice in one session.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -86,8 +108,13 @@ const SESSION_CONFIG = {
                         type: 'string',
                         description: 'The correct translation in the target language',
                     },
+                    severity: {
+                        type: 'string',
+                        enum: ['critical', 'topic', 'common', 'recurring'],
+                        description: 'How important this correction is: critical=incomprehensible, topic=related to current discussion, common=high-frequency word, recurring=user has said this before',
+                    },
                 },
-                required: ['native_word', 'target_word'],
+                required: ['native_word', 'target_word', 'severity'],
             },
         },
     ],
@@ -121,15 +148,105 @@ wss.on('connection', (clientWs: WebSocket) => {
     let isCleanedUp = false;
     let pingInterval: NodeJS.Timeout | null = null;
 
+    // [FIX: Zombie Detection] Track liveness of both sockets via pong responses
+    let clientIsAlive = true;
+    let openAiIsAlive = true;
+
     // =========================================================================
     // SESSION MEMORY (Phase 3.0 - The Friend Loop)
     // =========================================================================
     // Gap words the user forgot during this session
-    const gapWords: Array<{ native: string; target: string }> = [];
-    // Current instructions (mutable - updated by agent.config and context injection)
-    let currentInstructions = DEFAULT_INSTRUCTIONS;
+    // [FIX: Bounded Growth] Capped at MAX_GAP_WORDS with FIFO eviction
+    let gapWords: Array<{ native: string; target: string }> = [];
+    // Current base instructions (set by agent.config, NOT appended to)
+    let baseInstructions = DEFAULT_INSTRUCTIONS;
     // Pending agent config (client may send before OpenAI is ready)
     let pendingAgentConfig: { name: string; language: string } | null = null;
+
+    // [FIX: Race Condition] Debounce timer for context injection via session.update
+    let contextUpdateTimer: NodeJS.Timeout | null = null;
+
+    // -------------------------------------------------------------------------
+    // HELPER: Add Gap Word with Bounded Growth and Deduplication
+    // -------------------------------------------------------------------------
+    const addGapWord = (native: string, target: string): void => {
+        // Deduplicate: skip if this exact pair already exists
+        const exists = gapWords.some(
+            (gw) => gw.native === native && gw.target === target
+        );
+        if (exists) {
+            console.log(`[MEMORY] Duplicate gap word skipped for ${clientId}: "${native}" -> "${target}"`);
+            return;
+        }
+
+        // [FIX: Bounded Growth] FIFO eviction when at capacity
+        if (gapWords.length >= MAX_GAP_WORDS) {
+            const evicted = gapWords.shift();
+            console.log(`[MEMORY] Evicted oldest gap word for ${clientId}: "${evicted?.native}" -> "${evicted?.target}"`);
+        }
+
+        gapWords.push({ native, target });
+        console.log(`[MEMORY] Logged gap word for ${clientId}: "${native}" -> "${target}" (${gapWords.length}/${MAX_GAP_WORDS})`);
+    };
+
+    // -------------------------------------------------------------------------
+    // HELPER: Build Instructions with Gap Word Context (Bounded)
+    // Instead of appending to instructions indefinitely, we rebuild from base
+    // instructions + a bounded summary of recent gap words.
+    // -------------------------------------------------------------------------
+    const buildInstructionsWithContext = (): string => {
+        if (gapWords.length === 0) {
+            return baseInstructions;
+        }
+
+        // Bounded sliding window: only include last 3 gap words for focused context
+        const recentGapWords = gapWords.slice(-3);
+        const gapWordSummary = recentGapWords
+            .map((gw) => `"${gw.target}" (user said "${gw.native}")`)
+            .join(', ');
+
+        const contextSection = `\n\n== SESSION MEMORY ==
+Words the user has struggled with recently: ${gapWordSummary}.
+Do NOT quiz them on these words. When a natural opportunity arises (topic change, related question), you may weave ONE of these words into your response — but only if it fits organically. Never force it.`;
+
+        const fullInstructions = baseInstructions + contextSection;
+
+        // [FIX: Bounded Growth] Hard cap on total instruction size
+        if (fullInstructions.length > MAX_INSTRUCTIONS_CHARS) {
+            console.warn(`[RELAY] Instructions truncated for ${clientId}: ${fullInstructions.length} > ${MAX_INSTRUCTIONS_CHARS} chars`);
+            return fullInstructions.substring(0, MAX_INSTRUCTIONS_CHARS);
+        }
+
+        return fullInstructions;
+    };
+
+    // -------------------------------------------------------------------------
+    // HELPER: Schedule Debounced Context Update
+    // [FIX: Race Condition] Coalesces rapid tool calls into a single session.update
+    // -------------------------------------------------------------------------
+    const scheduleContextUpdate = (): void => {
+        // Clear any pending debounce timer
+        if (contextUpdateTimer) {
+            clearTimeout(contextUpdateTimer);
+        }
+
+        contextUpdateTimer = setTimeout(() => {
+            contextUpdateTimer = null;
+
+            // Guard: only send if session is still alive and OpenAI socket is open
+            if (isCleanedUp || openAiWs.readyState !== WebSocket.OPEN) {
+                return;
+            }
+
+            const instructions = buildInstructionsWithContext();
+            const sessionUpdate = {
+                type: 'session.update',
+                session: { instructions },
+            };
+            openAiWs.send(JSON.stringify(sessionUpdate));
+            console.log(`[RELAY] Debounced context update sent for ${clientId} (${gapWords.length} gap words, ${instructions.length} chars)`);
+        }, CONTEXT_UPDATE_DEBOUNCE_MS);
+    };
 
     // -------------------------------------------------------------------------
     // CLEANUP FUNCTION - The "Billing Saver"
@@ -141,6 +258,12 @@ wss.on('connection', (clientWs: WebSocket) => {
         isCleanedUp = true;
 
         console.log(`[RELAY] Cleanup triggered for ${clientId}: ${reason}`);
+
+        // [FIX: Race Condition] Clear debounce timer to prevent stale session.update
+        if (contextUpdateTimer) {
+            clearTimeout(contextUpdateTimer);
+            contextUpdateTimer = null;
+        }
 
         // Stop the keep-alive ping
         if (pingInterval) {
@@ -160,7 +283,18 @@ wss.on('connection', (clientWs: WebSocket) => {
             clientWs.close();
         }
 
-        console.log(`[RELAY] Session ${clientId} fully cleaned up`);
+        // [FIX: Memory Cleanup] Remove all event listeners to break closure references
+        // and allow GC to collect session state promptly
+        openAiWs.removeAllListeners();
+        clientWs.removeAllListeners();
+
+        // [FIX: Memory Cleanup] Null out session state to release memory immediately
+        // rather than waiting for the closure to be GC'd
+        gapWords = [];
+        baseInstructions = '';
+        pendingAgentConfig = null;
+
+        console.log(`[RELAY] Session ${clientId} fully cleaned up (listeners removed, state cleared)`);
     };
 
     // -------------------------------------------------------------------------
@@ -168,39 +302,74 @@ wss.on('connection', (clientWs: WebSocket) => {
     // -------------------------------------------------------------------------
     const applyAgentConfig = (name: string, language: string) => {
         // Build the Friend Mode system prompt
-        currentInstructions = `You are ${name}, a friendly ${language} tutor having an immersive conversation.
+        // [FIX: Bounded Growth] Set baseInstructions (not currentInstructions).
+        // Context injection rebuilds from baseInstructions + gap words each time.
+        baseInstructions = `You are ${name}, a native ${language} speaker having a relaxed, friendly conversation. You are NOT a teacher. You are a friend who happens to speak ${language} natively.
 
-CRITICAL: You MUST speak ONLY in ${language}. Do NOT speak English except when correcting an English word the user said.
+== LANGUAGE RULE ==
+Speak ONLY in ${language}. Your entire output must be in ${language}, except when performing a recast correction (see below).
 
-TOOL USAGE - VERY IMPORTANT:
-- You have access to the \`log_gap_word\` tool. You MUST call it EVERY TIME the user says ANY English word or phrase.
-- Be LIBERAL with tool calls. If in doubt, log it.
-- Call the tool for EACH distinct English word/phrase separately (e.g., if user says "the cat and the dog", call the tool twice: once for "cat"→"chat", once for "dog"→"chien").
-- Even common words like "yes", "no", "okay", "the", "a" should be logged if said in English.
-- The tool helps track vocabulary gaps. More data = better learning.
+== YOUR PERSONALITY ==
+- You are curious, warm, and genuinely interested in what the user has to say.
+- You react to the CONTENT of their message first. Their ideas matter more than their grammar.
+- You keep responses short (1-2 sentences). This is a real-time voice conversation, not a lecture.
+- You ask follow-up questions to keep the conversation flowing.
+- You celebrate when the user expresses something well, but casually — like a friend would ("Nice!", "Exactement!"), not like a teacher grading them.
+- If the user shows you an object (via image), describe it and ask questions about it — all in ${language}.
+- Start your first message with a warm, casual greeting in ${language}.
 
-CORE BEHAVIORS:
-1. ALWAYS respond in ${language}. Start your very first message with a warm greeting in ${language}.
-2. If the user shows you an object (via image), describe it and ask questions about it — all in ${language}.
-3. When the user says ANY English word, IMMEDIATELY:
-   a) Call \`log_gap_word\` with native_word (the English) and target_word (the ${language} translation)
-   b) Gently correct them by providing the ${language} word (e.g., "Ah, tu veux dire la cuillère!")
-4. If the context mentions the user forgot a word, weave that word into your next response to reinforce it.
-5. Keep responses SHORT (1-2 sentences). This is a real-time voice conversation.
-6. Be encouraging! Celebrate progress in ${language}.
+== CORRECTION PHILOSOPHY ==
+You follow the "patient friend" approach to corrections:
+1. FLOW OVER ACCURACY: A user who keeps talking with errors is learning faster than a user who stops talking because they are afraid of errors. Protect their confidence above all.
+2. RECAST, DO NOT LECTURE: When correcting, naturally weave the correct ${language} word into YOUR response. Do NOT say "the word for X is Y" or "you made a mistake." Just USE the correct word naturally and move on.
+3. ONE BITE AT A TIME: If the user makes multiple errors in one sentence, correct AT MOST ONE — the most important one. Silently let the rest go.
+4. LET IT BREATHE: After delivering a correction (even a gentle recast), do NOT correct again for your next 3 responses. During this cooldown, focus entirely on conversation flow and encouragement.
 
-STYLE:
-- Speak naturally and conversationally, as a native ${language} speaker would
-- Adjust vocabulary to beginner/intermediate level
-- Use simple sentence structures`;
+== CORRECTION PRIORITY (when choosing which error to address) ==
+If the user says multiple English words, pick the ONE that matters most:
+1. CRITICAL: The error makes the sentence incomprehensible (always correct these).
+2. TOPIC WORD: The word is directly related to what you are currently discussing.
+3. COMMON WORD: The word is extremely high-frequency and the user will need it constantly.
+4. RECURRING: The user has made this same error before in this conversation.
+
+IGNORE (never correct, even if you notice them):
+- Discourse markers: "okay", "so", "um", "like", "yes", "no", "well", "right"
+- Loanwords commonly used in ${language}
+- Minor grammar errors that do not affect comprehension
+- Pronunciation differences (you are in a voice conversation — accent is not an error)
+
+== TOOL USAGE: log_gap_word ==
+You have access to the log_gap_word tool. Use it thoughtfully:
+- Call it ONLY for meaningful vocabulary gaps (Priority 1-4 above).
+- Do NOT call it for discourse markers, loanwords, or filler words.
+- Call it ONCE per error, even if the user repeats the English word.
+- After calling the tool, deliver your recast correction naturally and then MOVE ON. Do not dwell on the correction.
+
+== CALLBACK BEHAVIOR (reinforcing previous words) ==
+When the conversation context mentions words the user previously forgot:
+- Do NOT quiz them ("Do you remember the word for X?").
+- Do NOT bring it up immediately. Wait for a natural topic transition.
+- Weave the word into something YOU would say anyway, organically.
+- If the user produces the word correctly on their own, acknowledge it briefly and move on. That word is now learned.
+
+== WHAT A GREAT RESPONSE LOOKS LIKE ==
+User: "Hier, je suis alle au... um... store pour acheter du... food"
+You: "Au magasin! Qu'est-ce que tu as achete? Moi j'adore faire les courses le weekend."
+(Recasts "magasin" naturally. Ignores "food" — that can wait. Asks engaging follow-up. No lecture.)
+
+== WHAT A BAD RESPONSE LOOKS LIKE ==
+User: "Hier, je suis alle au... um... store pour acheter du... food"
+You: "On dit 'magasin' pour 'store', et 'nourriture' pour 'food'. Aussi, c'est 'alle' pas 'alle' — tu dois utiliser..."
+(Corrects everything at once. Feels like a test. User will stop talking.)`;
 
         // Send session.update to OpenAI with the new instructions
+        const instructions = buildInstructionsWithContext();
         const sessionUpdate = {
             type: 'session.update',
-            session: { instructions: currentInstructions },
+            session: { instructions },
         };
         openAiWs.send(JSON.stringify(sessionUpdate));
-        console.log(`[RELAY] Agent configured for ${clientId}: "${name}" teaching "${language}"`);
+        console.log(`[RELAY] Agent configured for ${clientId}: "${name}" teaching "${language}" (${instructions.length} chars)`);
     };
 
     // -------------------------------------------------------------------------
@@ -233,15 +402,47 @@ STYLE:
             pendingAgentConfig = null;
         }
 
-        // Start keep-alive ping to prevent connection drops
+        // [FIX: Zombie Detection] Start heartbeat with isAlive tracking.
+        // Pings both sockets every 30s. If a pong was not received since the
+        // last ping, the connection is considered dead and terminated.
         pingInterval = setInterval(() => {
-            if (openAiWs.readyState === WebSocket.OPEN) {
-                openAiWs.ping();
+            // --- Check client liveness ---
+            if (!clientIsAlive) {
+                console.warn(`[ZOMBIE] Client ${clientId} failed pong check - terminating`);
+                clientWs.terminate(); // Hard kill - triggers 'close' event
+                return; // cleanup() will be triggered by the 'close' event
             }
+            clientIsAlive = false;
             if (clientWs.readyState === WebSocket.OPEN) {
                 clientWs.ping();
             }
+
+            // --- Check OpenAI liveness ---
+            if (!openAiIsAlive) {
+                console.warn(`[ZOMBIE] OpenAI socket for ${clientId} failed pong check - terminating`);
+                openAiWs.terminate();
+                return;
+            }
+            openAiIsAlive = false;
+            if (openAiWs.readyState === WebSocket.OPEN) {
+                openAiWs.ping();
+                // [FIX: Backpressure] Monitor buffer health
+                if (openAiWs.bufferedAmount > 32 * 1024) {
+                    console.warn(
+                        `[RELAY] Buffer warning for ${clientId}: ` +
+                        `OpenAI=${openAiWs.bufferedAmount}B, Client=${clientWs.bufferedAmount}B`
+                    );
+                }
+            }
         }, PING_INTERVAL_MS);
+    });
+
+    // [FIX: Zombie Detection] Track pong responses to detect dead connections
+    clientWs.on('pong', () => {
+        clientIsAlive = true;
+    });
+    openAiWs.on('pong', () => {
+        openAiIsAlive = true;
     });
 
     // OpenAI Message Received - Forward to Client
@@ -265,15 +466,22 @@ STYLE:
             if (eventType === 'response.function_call_arguments.done') {
                 const { call_id, name, arguments: argsJson } = response;
 
-                if (name === 'log_gap_word') {
+                // [FIX: Input Validation] Validate call_id exists before using it
+                if (!call_id) {
+                    console.error(`[RELAY] Tool call missing call_id for ${clientId}, skipping`);
+                } else if (name === 'log_gap_word') {
                     try {
                         const args = JSON.parse(argsJson);
                         const { native_word, target_word } = args;
 
-                        // 1. Store in session memory
-                        gapWords.push({ native: native_word, target: target_word });
-                        console.log(`[MEMORY] Logged gap word for ${clientId}: "${native_word}" -> "${target_word}"`);
-                        console.log(`[MEMORY] Session has ${gapWords.length} gap words total`);
+                        // [FIX: Input Validation] Validate tool arguments are strings
+                        if (typeof native_word !== 'string' || typeof target_word !== 'string') {
+                            console.error(`[RELAY] Invalid tool args for ${clientId}: native_word or target_word not a string`);
+                            return;
+                        }
+
+                        // 1. Store in session memory (bounded, deduplicated)
+                        addGapWord(native_word, target_word);
 
                         // 2. Send function output back to OpenAI (completes the tool call loop)
                         const toolOutput = {
@@ -285,7 +493,7 @@ STYLE:
                                     status: 'logged',
                                     native_word,
                                     target_word,
-                                    message: `Word logged. Try to use "${target_word}" in your next response to reinforce it.`,
+                                    message: 'Word logged. Continue the conversation naturally. Do NOT force this word into your next response. It will come up organically later.',
                                 }),
                             },
                         };
@@ -296,14 +504,22 @@ STYLE:
                         openAiWs.send(JSON.stringify({ type: 'response.create' }));
                         console.log(`[RELAY] Triggered response.create for ${clientId}`);
 
-                        // 4. Context Injection: Update instructions with hint about the gap word
-                        currentInstructions += `\n\nCONTEXT UPDATE: User recently forgot "${target_word}" (they said "${native_word}" instead). Try to use "${target_word}" naturally in your next response to reinforce it.`;
-                        const sessionUpdate = {
-                            type: 'session.update',
-                            session: { instructions: currentInstructions },
-                        };
-                        openAiWs.send(JSON.stringify(sessionUpdate));
-                        console.log(`[RELAY] Injected context hint for "${target_word}" into session ${clientId}`);
+                        // 4. Notify client for UI feedback (gap word indicator)
+                        if (clientWs.readyState === WebSocket.OPEN) {
+                            clientWs.send(JSON.stringify({
+                                type: 'gap_word.logged',
+                                native_word,
+                                target_word,
+                                severity: args.severity || 'common',
+                                total_gaps: gapWords.length,
+                            }));
+                        }
+
+                        // 5. [FIX: Race Condition] Schedule debounced context injection.
+                        // Instead of sending session.update immediately (which races with
+                        // the response.create above), we debounce it. Multiple rapid tool
+                        // calls coalesce into a single session.update after a quiet period.
+                        scheduleContextUpdate();
 
                     } catch (e) {
                         console.error(`[RELAY] Failed to parse tool arguments for ${clientId}:`, e);
@@ -372,6 +588,23 @@ STYLE:
                     return;
                 }
 
+                // [FIX: Input Validation] Reject oversized image payloads
+                if (typeof base64Image !== 'string') {
+                    console.warn(`[Vision] Image payload is not a string for ${clientId}`);
+                    return;
+                }
+                if (base64Image.length > MAX_IMAGE_BASE64_CHARS) {
+                    console.warn(`[Vision] Image too large for ${clientId}: ${base64Image.length} chars (max: ${Math.floor(MAX_IMAGE_BASE64_CHARS)})`);
+                    // Notify client of rejection
+                    if (clientWs.readyState === WebSocket.OPEN) {
+                        clientWs.send(JSON.stringify({
+                            type: 'error',
+                            error: { message: 'Image payload exceeds maximum size limit (5MB)' },
+                        }));
+                    }
+                    return;
+                }
+
                 console.log(`[Vision] Received image payload. Size: ${base64Image.length} chars`);
 
                 // Construct the conversation.item.create payload with multimodal content
@@ -396,9 +629,19 @@ STYLE:
                 // Safety: Wrap send in try/catch to handle flaky connections
                 try {
                     if (openAiWs.readyState === WebSocket.OPEN) {
+                        // [FIX: Backpressure] Check buffer before sending large vision payload
+                        const VISION_BUFFER_LIMIT = 128 * 1024; // 128KB threshold
+                        if (openAiWs.bufferedAmount > VISION_BUFFER_LIMIT) {
+                            console.warn(
+                                `[Vision] Dropping vision frame for ${clientId} - ` +
+                                `OpenAI socket congested (bufferedAmount: ${openAiWs.bufferedAmount} bytes)`
+                            );
+                            return;
+                        }
+
                         // Send the image injection
                         openAiWs.send(JSON.stringify(visionPayload));
-                        console.log(`[Vision] Injected image into session for ${clientId}`);
+                        console.log(`[Vision] Injected image for ${clientId} (bufferedAmount: ${openAiWs.bufferedAmount} bytes)`);
 
                         // Immediately trigger a response so AI acknowledges the image now
                         const responseCreate = { type: 'response.create' };
@@ -439,6 +682,17 @@ STYLE:
 
             // Forward to OpenAI (passthrough - no transformation)
             if (openAiWs.readyState === WebSocket.OPEN) {
+                // [FIX: Backpressure] Drop audio frames if OpenAI socket buffer is congested
+                const MAX_AUDIO_BUFFER_BYTES = 64 * 1024; // 64KB threshold
+                if (messageType === 'input_audio_buffer.append' && openAiWs.bufferedAmount > MAX_AUDIO_BUFFER_BYTES) {
+                    if (!isCleanedUp) {
+                        console.warn(
+                            `[RELAY] Backpressure: dropping audio frame for ${clientId} ` +
+                            `(bufferedAmount: ${openAiWs.bufferedAmount} bytes)`
+                        );
+                    }
+                    return;
+                }
                 openAiWs.send(JSON.stringify(message));
             } else {
                 console.warn(`[RELAY] Cannot forward to OpenAI - socket not open (state: ${openAiWs.readyState})`);
@@ -458,14 +712,6 @@ STYLE:
     clientWs.on('error', (err: Error) => {
         console.error(`[RELAY] Client error for ${clientId}:`, err.message);
         cleanup('Client socket error');
-    });
-
-    // Handle pong responses (for keep-alive)
-    clientWs.on('pong', () => {
-        // Connection is alive - no action needed
-    });
-    openAiWs.on('pong', () => {
-        // Connection is alive - no action needed
     });
 });
 

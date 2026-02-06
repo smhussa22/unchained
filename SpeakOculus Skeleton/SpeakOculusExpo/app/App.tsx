@@ -27,6 +27,8 @@ import Animated, {
   Extrapolation,
   Easing,
   runOnJS,
+  runOnUI,
+  useAnimatedReaction,
   SharedValue,
 } from 'react-native-reanimated';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -62,7 +64,7 @@ import { useCameraStabilityWithReset } from './hooks/useCameraStability';
 // CONFIGURATION
 // ============================================================================
 // Set to true to use the relay running on your machine.
-const USE_LOCAL_RELAY = true;
+const USE_LOCAL_RELAY = false;
 const RELAY_PRODUCTION_URL = 'ws://98.92.191.197:8082';
 const RELAY_PORT = 8082;
 // Physical Android via USB: use adb reverse, then connect to localhost (set below).
@@ -163,6 +165,7 @@ const MainScreen = () => {
   const [isConnected, setIsConnected] = useState(false);
   const [agentName, setAgentName] = useState('Assistant');
   const [interactionMode, setInteractionMode] = useState<OrbMode>('idle');
+  const interactionModeRef = useRef<OrbMode>('idle');
   const [permissionGranted, setPermissionGranted] = useState(false);
 
   // Agent Configuration State
@@ -202,6 +205,7 @@ const MainScreen = () => {
   // Vision Tracking
   const lastCaptureTimeRef = useRef<number>(0);
   const captureInProgressRef = useRef(false);
+  const visionSendInProgressRef = useRef(false);
 
   // -------------------------------------------------------------------------
   // AUDIO CONTEXT & STREAMING REFS
@@ -230,13 +234,18 @@ const MainScreen = () => {
     isMutedRef.current = isMuted;
   }, [isMuted]);
 
+  // Sync interactionMode state to ref for use in WebSocket handler (avoids stale closure)
+  useEffect(() => {
+    interactionModeRef.current = interactionMode;
+  }, [interactionMode]);
+
   // -------------------------------------------------------------------------
   // STABILITY HOOK (Auto-Vision Trigger)
   // -------------------------------------------------------------------------
   const {
-    isStable,
+    isStableSV,
     stabilityProgress,
-    variance,
+    varianceSV,
     resetStability,
   } = useCameraStabilityWithReset({
     enabled: visionEnabled && isConnected && isCameraOn && !isCapturing,
@@ -248,11 +257,13 @@ const MainScreen = () => {
   const calculateRMS = useCallback((base64Data: string): number => {
     try {
       const buffer = Buffer.from(base64Data, 'base64');
-      if (buffer.length < 2) return 0;
-      const samples = Math.floor(buffer.length / 2);
+      const len = buffer.length;
+      if (len < 2) return 0;
+      const samples = len >> 1;
+      const view = new DataView(buffer.buffer, buffer.byteOffset, len);
       let sum = 0;
-      for (let i = 0; i < buffer.length - 1; i += 2) {
-        const sample = buffer.readInt16LE(i);
+      for (let i = 0; i < len - 1; i += 2) {
+        const sample = view.getInt16(i, true);
         sum += sample * sample;
       }
       return Math.min(Math.sqrt(sum / samples) / 16000, 1);
@@ -314,7 +325,7 @@ const MainScreen = () => {
       setIsCapturing(true);
 
       // 1. Trigger flash animation (run on UI thread)
-      runOnJS(triggerFlash)();
+      runOnUI(triggerFlash)();
 
       // 2. Set mode to processing
       setInteractionMode('processing');
@@ -388,10 +399,10 @@ const MainScreen = () => {
             },
           },
           {
-            resize: { width: 512, height: 512 }, // Standardize output size
+            resize: { width: 384, height: 384 }, // Standardize output size
           },
         ],
-        { base64: true, compress: 0.7, format: ImageManipulator.SaveFormat.JPEG }
+        { base64: true, compress: 0.5, format: ImageManipulator.SaveFormat.JPEG }
       );
 
       if (!croppedImage.base64) {
@@ -400,7 +411,7 @@ const MainScreen = () => {
         return;
       }
 
-      debugLog('VISION', `Cropped image: 512x512, base64 length: ${croppedImage.base64.length}`);
+      debugLog('VISION', `Cropped image: 384x384, base64 length: ${croppedImage.base64.length}`);
 
       // 6. Send to WebSocket
       const payload = {
@@ -409,7 +420,11 @@ const MainScreen = () => {
         timestamp: now,
       };
 
+      visionSendInProgressRef.current = true;
+      const visionTimeout = setTimeout(() => { visionSendInProgressRef.current = false; }, 200);
       wsRef.current.send(JSON.stringify(payload));
+      visionSendInProgressRef.current = false;
+      clearTimeout(visionTimeout);
       debugLog('VISION', 'Frame sent to server');
 
       // 6. Update cooldown
@@ -428,21 +443,16 @@ const MainScreen = () => {
   }, [triggerFlash, resetStability]);
 
   // -------------------------------------------------------------------------
-  // STABILITY-TRIGGERED CAPTURE
+  // STABILITY-TRIGGERED CAPTURE (via SharedValue reaction, no re-renders)
   // -------------------------------------------------------------------------
-  useEffect(() => {
-    if (isStable && !isCapturing && !isPlayingRef.current) {
-      debugLog('VISION', 'Device stable - triggering capture');
-      captureAndSendFrame();
+  useAnimatedReaction(
+    () => isStableSV.value,
+    (currentlyStable, previouslyStable) => {
+      if (currentlyStable && !previouslyStable) {
+        runOnJS(captureAndSendFrame)();
+      }
     }
-  }, [isStable, isCapturing, captureAndSendFrame]);
-
-  // Log stability progress for debugging
-  useEffect(() => {
-    if (stabilityProgress > 0 && stabilityProgress < 1) {
-      debugLog('STABILITY', `Progress: ${Math.round(stabilityProgress * 100)}%, Variance: ${variance.toFixed(4)}`);
-    }
-  }, [stabilityProgress, variance]);
+  );
 
   // -------------------------------------------------------------------------
   // STREAMING AUDIO LOGIC
@@ -612,10 +622,18 @@ const MainScreen = () => {
       // Early return if muted (use ref to avoid stale closure)
       if (isMutedRef.current) {
         // Still update visualization when muted (shows user they're speaking but muted)
-        volumeLevel.value = withSpring(rms * 0.3, {
-          damping: 15,
-          stiffness: 400,
-          mass: 0.5,
+        volumeLevel.value = withTiming(rms * 0.3, {
+          duration: 40,
+          easing: Easing.out(Easing.quad),
+        });
+        return;
+      }
+
+      // Vision pause: throttle audio during vision frame upload to prevent stutter
+      if (visionSendInProgressRef.current) {
+        volumeLevel.value = withTiming(rms * 0.3, {
+          duration: 40,
+          easing: Easing.out(Easing.quad),
         });
         return;
       }
@@ -634,10 +652,9 @@ const MainScreen = () => {
       if (isPlayingRef.current) {
         if (rms < BARGE_IN_RMS_THRESHOLD) {
           // Below threshold - likely echo, suppress
-          volumeLevel.value = withSpring(rms * 0.2, {
-            damping: 15,
-            stiffness: 400,
-            mass: 0.5,
+          volumeLevel.value = withTiming(rms * 0.2, {
+            duration: 40,
+            easing: Easing.out(Easing.quad),
           });
           return; // Don't send - this is probably echo
         }
@@ -645,12 +662,10 @@ const MainScreen = () => {
         debugLog('BARGE-IN', `Loud audio during playback (RMS: ${rms.toFixed(3)}) - allowing through`);
       }
 
-      // Update volume visualization with fast spring for smooth 60fps reactivity
-      // Springs handle interruption gracefully (unlike withTiming)
-      volumeLevel.value = withSpring(rms, {
-        damping: 15,
-        stiffness: 400,
-        mass: 0.5,
+      // Update volume visualization with timing matched to 40ms audio chunk cadence
+      volumeLevel.value = withTiming(rms, {
+        duration: 40,
+        easing: Easing.out(Easing.quad),
       });
 
       // Send audio to relay server
@@ -739,7 +754,7 @@ const MainScreen = () => {
             lastResponseItemIdRef.current = data.item_id;
           }
 
-          if (interactionMode !== 'speaking') {
+          if (interactionModeRef.current !== 'speaking') {
             debugLog('MODE', 'Mode: -> speaking (streaming started)');
             setInteractionMode('speaking');
 
@@ -819,7 +834,7 @@ const MainScreen = () => {
     } catch (e) {
       console.log('[CLIENT] Non-JSON message received');
     }
-  }, [scheduleAudioChunk, stopAudioPlayback, interactionMode, initAudioContext, startRecording]);
+  }, [scheduleAudioChunk, stopAudioPlayback, initAudioContext, startRecording]);
 
   // -------------------------------------------------------------------------
   // WEBSOCKET CONNECTION
@@ -1213,7 +1228,7 @@ const MainScreen = () => {
             mode={interactionMode}
             volumeLevel={volumeLevel}
             stabilityProgress={stabilityProgress}
-            isStable={isStable}
+            isStable={isStableSV}
           />
         </View>
 

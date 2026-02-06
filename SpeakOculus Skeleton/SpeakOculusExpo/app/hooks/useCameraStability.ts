@@ -13,6 +13,14 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Accelerometer, AccelerometerMeasurement } from 'expo-sensors';
+import { useSharedValue, SharedValue } from 'react-native-reanimated';
+
+export interface StabilityResultSV {
+  stabilityProgress: SharedValue<number>;  // 0-1, drives UI thread animations
+  isStableSV: SharedValue<boolean>;        // true when fully stable
+  varianceSV: SharedValue<number>;         // for debug
+  resetStability: () => void;
+}
 
 // ============================================================================
 // CONFIGURATION
@@ -212,21 +220,30 @@ export function useCameraStability(options: UseCameraStabilityOptions = {}): Sta
 }
 
 /**
- * Extended version with reset capability exposed
+ * Extended version with reset capability exposed.
+ * Uses SharedValues instead of React state to avoid 60 re-renders/sec
+ * from accelerometer callbacks. All output values are SharedValues that
+ * drive UI thread animations with zero React re-renders.
  */
-export function useCameraStabilityWithReset(options: UseCameraStabilityOptions = {}) {
+export function useCameraStabilityWithReset(options: UseCameraStabilityOptions = {}): StabilityResultSV {
   const { enabled = true, onStabilized } = options;
 
-  const [state, setState] = useState<StabilityState>({
-    isStable: false,
-    stabilityProgress: 0,
-    variance: 0,
-  });
+  // SharedValues for output - drive UI thread animations with zero re-renders
+  const stabilityProgress = useSharedValue(0);
+  const isStableSV = useSharedValue(false);
+  const varianceSV = useSharedValue(0);
 
+  // Refs for internal tracking (no state, no re-renders)
   const samplesRef = useRef<AccelerometerMeasurement[]>([]);
   const stableStartTimeRef = useRef<number | null>(null);
   const wasStableRef = useRef(false);
   const subscriptionRef = useRef<ReturnType<typeof Accelerometer.addListener> | null>(null);
+  const onStabilizedRef = useRef(onStabilized);
+
+  // Keep callback ref up to date without triggering effect re-runs
+  useEffect(() => {
+    onStabilizedRef.current = onStabilized;
+  }, [onStabilized]);
 
   const calculateVariance = useCallback((samples: AccelerometerMeasurement[]): number => {
     if (samples.length < 2) return 1;
@@ -255,12 +272,10 @@ export function useCameraStabilityWithReset(options: UseCameraStabilityOptions =
     samplesRef.current = [];
     stableStartTimeRef.current = null;
     wasStableRef.current = false;
-    setState({
-      isStable: false,
-      stabilityProgress: 0,
-      variance: 0,
-    });
-  }, []);
+    stabilityProgress.value = 0;
+    isStableSV.value = false;
+    varianceSV.value = 0;
+  }, [stabilityProgress, isStableSV, varianceSV]);
 
   const handleAccelerometerData = useCallback((data: AccelerometerMeasurement) => {
     const samples = samplesRef.current;
@@ -271,12 +286,9 @@ export function useCameraStabilityWithReset(options: UseCameraStabilityOptions =
     }
 
     if (samples.length < WINDOW_SIZE / 2) {
-      setState(prev => ({
-        ...prev,
-        variance: 1,
-        stabilityProgress: 0,
-        isStable: false,
-      }));
+      varianceSV.value = 1;
+      stabilityProgress.value = 0;
+      isStableSV.value = false;
       return;
     }
 
@@ -295,25 +307,21 @@ export function useCameraStabilityWithReset(options: UseCameraStabilityOptions =
 
       if (isFullyStable && !wasStableRef.current) {
         wasStableRef.current = true;
-        onStabilized?.();
+        onStabilizedRef.current?.();
       }
 
-      setState({
-        variance,
-        stabilityProgress: progress,
-        isStable: isFullyStable,
-      });
+      varianceSV.value = variance;
+      stabilityProgress.value = progress;
+      isStableSV.value = isFullyStable;
     } else {
       stableStartTimeRef.current = null;
       wasStableRef.current = false;
 
-      setState({
-        variance,
-        stabilityProgress: 0,
-        isStable: false,
-      });
+      varianceSV.value = variance;
+      stabilityProgress.value = 0;
+      isStableSV.value = false;
     }
-  }, [calculateVariance, onStabilized]);
+  }, [calculateVariance, stabilityProgress, isStableSV, varianceSV]);
 
   useEffect(() => {
     if (!enabled) {
@@ -337,9 +345,12 @@ export function useCameraStabilityWithReset(options: UseCameraStabilityOptions =
   }, [enabled, handleAccelerometerData, resetStability]);
 
   return {
-    ...state,
+    stabilityProgress,
+    isStableSV,
+    varianceSV,
     resetStability,
   };
 }
 
 export default useCameraStability;
+export type { StabilityResultSV as StabilityResultSVType };

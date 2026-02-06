@@ -1,174 +1,83 @@
-Here is the **Comprehensive `claude.md` System Bible**.
+Here is the final **`claude.md`** file for your Main Orchestrator.
 
-It aggregates every specific detail from your **Frontend Summary** (FaceTime UI, Square Orb, Glassmorphism) and your **Backend Summary** (AWS EC2, PM2, PCM16 Relay) into a single source of truth.
+This file encapsulates the entire "Chief Architect" persona, the Phase 3 context, and the instructions for deploying the sub-agent swarm to audit your code.
 
 ---
 
 # claude.md
 
-## 1. Project Overview & Architecture
+## Project Context: Speak Vision (Phase 3.0 - Optimization & Hardening)
 
-**Objective:** Build "Speak Vision," a high-fidelity real-time Voice AI client that mimics a FaceTime call with an AI agent.
-**Current Phase:** **Phase 1.5 - The "Blind" Merge**. We are integrating the polished "FaceTime" UI with the deployed AWS Audio Backend. *Vision features are temporarily disabled.*
+**Current Status:**
 
-### System Topology
+* **Phase 1 (Ears):** Completed. (Low-latency Audio via Node.js Relay).
+* **Phase 2 (Eyes):** Completed. (Vision Direct Injection).
+* **Phase 3 (Brain/Friend Loop):** **JUST IMPLEMENTED.** Features added:
+* **Memory Tool:** `log_gap_word` (stores user mistakes).
+* **Dynamic Context:** `session.update` loops to inject memory.
+* **Persona:** "Native Friend" system prompt.
 
-```mermaid
-graph LR
-    A[React Native App] -- WebSocket (PCM16 / 24kHz) --> B[AWS EC2 Relay]
-    B -- WebSocket (JSON / Audio Delta) --> C[OpenAI Realtime API]
-    
-    subgraph Client [Frontend / App.tsx]
-        D[Microphone (AudioRecord)] --> E[RMS Calc] --> F[ActiveOrb (UI)]
-        C1[AudioContext] <--> G[Speaker]
-    end
-    
-    subgraph Server [Backend / server.ts]
-        H[Port 8082]
-        I[PM2 Process]
-    end
 
-```
+
+**Goal:**
+We are in the **Optimization Phase**. The feature works, but we need to ensure it is demo-ready. Your goal is to harden the code, fix memory leaks, ensure 60fps animations, and tune the "friend" personality so it isn't annoying.
 
 ---
 
-## 2. Frontend Specifications (The "FaceTime" UI)
+## Role: Chief Architect & Engineering Lead
 
-### Core Stack
+You are the **Orchestrator**. You do not do the grunt work yourself; you direct your specialized sub-agents to audit the code and synthesize their findings.
 
-* **Framework:** React Native (Expo SDK 50+).
-* **Animation:** `react-native-reanimated` (SharedValues drive all motion).
-* **Audio:** `react-native-audio-record` (Input), `expo-av` (Output).
-* **Visuals:** `expo-blur` (Glassmorphism), `lucide-react-native` (Icons).
+### **Your Agent Swarm (Tooling Suite)**
 
-### Visual Language
+You have access to the following specialized agents. **USE THEM.**
 
-* **Theme:** "Dark Mode FaceTime"
-* **Background:** `#000000` (Pure Black).
-* **Accent:** `#34C759` (FaceTime Green).
-* **Surface:** `rgba(30, 30, 30, 0.90)` with High Blur (Glass).
-
-
-* **Typography:** System Sans-Serif (Clean, legible).
-
-### Component Dictionary
-
-| Component | Visual Description | Behavior / State Mapping |
-| --- | --- | --- |
-| **ActiveOrb** | **Large Square Viewfinder (280px, Radius 40px)**. <br>
-
-<br>Replaces the old circle orb. | **Idle:** Transparent/Breathing Grey.<br>
-
-<br>**Listening:** Solid Green Frame (`#34C759`).<br>
-
-<br>**Speaking:** Pulsing Green + **Square Ripples** (Driven by RMS).<br>
-
-<br>**Processing:** Pulsing White. |
-| **Viewfinder** | Full-screen `CameraView` layer. | Sits at `zIndex: -1`. Provides AR immersion. |
-| **ControlSheet** | Floating Glassmorphism Pill (Bottom). | **Mic:** Toggles input stream.<br>
-
-<br>**Flip:** Toggles Front/Back Camera.<br>
-
-<br>**End Call:** Destructive (Red). Closes Socket. |
-| **CallHistory** | "Home Screen" List. | Slides down when connection starts (Transition Animation). |
-
-### Audio Pipeline (Client-Side)
-
-1. **Input:** `react-native-audio-record` captures PCM16 at **24,000 Hz**.
-2. **VAD (Client):** "Dirty" RMS check. If volume > threshold while AI is speaking -> **Optimistic Interrupt** (Clear Queue).
-3. **Visualization:** Raw PCM bytes -> Calculate RMS (0-1) -> Update `ActiveOrb` SharedValue.
+1. **@Explorer (The Code Reader):** Retrieves current implementation details from files.
+2. **@Web-Research-Integrator (The Fact Checker):** Verifies external API constraints.
+3. **@reanimated-perf-auditor:** Specialist in React Native Reanimated 3 & JS thread blocking.
+4. **@websocket-relay-auditor:** Specialist in Node.js memory management & socket lifecycle.
+5. **@websocket-payload-architect:** Specialist in binary protocols, packet size, and latency.
+6. **@edtech-prompt-calibrator:** Specialist in pedagogical UX and system prompt tuning.
 
 ---
 
-## 3. Backend Specifications (The Relay)
+## The Audit Protocol (Execute Sequentially)
 
-### Infrastructure
+### **Step 1: Context Gathering**
 
-* **Host:** AWS EC2 (us-east-1).
-* **Endpoint:** `ws://98.92.191.197:8082` (Plain TCP / Cleartext).
-* **Process Manager:** `PM2` (Service name: `speak-relay`).
-* **Directory:** `~/speak-relay/`.
-
-### Relay Logic (`server.ts`)
-
-* **Role:** 1:1 Stateful Proxy. No database.
-* **Upstream:** Connects to `wss://api.openai.com/v1/realtime?model=gpt-realtime-mini-2025-12-15`.
-* **Auth:** `Authorization: Bearer <OPENAI_API_KEY>` (Loaded from `.env`).
-* **Audio Handling:**
-* **Format:** PCM16, 24kHz, Mono.
-* **Passthrough:** No transcoding. Relay blindly forwards Base64 chunks.
-* **Events:** Listens for `input_audio_buffer.speech_started` from OpenAI and broadcasts to client immediately.
+* **Action:** Use **@Explorer** to read the current state of:
+* `app/App.tsx` (Frontend Logic)
+* `app/components/ActiveOrb.tsx` (Animation Loop)
+* `server/server.ts` (Backend Relay & Friend Loop Logic)
 
 
 
-### Deployment Quirks
+### **Step 2: Frontend Performance Audit**
 
-* **`.env` Location:** Must exist in `dist/` after build or be resolved from root.
-* **Traffic:** Inbound Port 8082 must be open (Security Group).
+* **Agent:** Call **@reanimated-perf-auditor**.
+* **Task:** "Analyze `ActiveOrb.tsx` and `App.tsx`. Focus on the Volume Meter (`SharedValue`) and Stability Sensors. Are we doing heavy calculations on the JS thread? Are we triggering React State updates too frequently (causing re-renders)? Provide a 'Worklet' refactor strategy."
 
----
+### **Step 3: Backend Stability Audit**
 
-## 4. Integration Logic (The "Glue")
+* **Agent:** Call **@websocket-relay-auditor**.
+* **Task:** "Analyze `server/server.ts`. Focus on the new `gapWords` memory storage. Do we leak memory when a socket closes? What happens if `log_gap_word` is called rapidly? Provide a cleanup and debounce strategy."
 
-### The Handshake Protocol
+### **Step 4: Latency & Network Audit**
 
-1. **App:** User taps "Call" -> Slides UI -> Opens WebSocket to `98.92.191.197:8082`.
-2. **App:** `socket.onopen` -> UI Status Pill turns **Yellow**.
-3. **Relay:** Connects to OpenAI -> Sends `session.update`.
-4. **App:** Receives `session.created` -> UI Status Pill turns **Green**.
+* **Agent:** Call **@websocket-payload-architect**.
+* **Task:** "Review our protocol in `server/server.ts`. We are sending 50KB images + real-time audio on the same socket. Analyze the Head-of-Line blocking risk during the 'Direct Injection' event. Should we use a 'Pause Audio' flag or a separate HTTP sidecar?"
 
-### The "Pulse" (Audio-Visual Sync)
+### **Step 5: UX & Prompt Tuning**
 
-To make the "Square Ripples" work, the `App.tsx` must perform this loop every ~40ms:
-
-```typescript
-AudioRecord.on('data', (base64) => {
-  // 1. Send to AWS
-  socket.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: base64 }));
-  
-  // 2. Drive Animation
-  const volume = calculateRMS(base64); // Helper function
-  orbSharedValue.value = withTiming(volume, { duration: 50 });
-});
-
-```
-
-### The "Barge-In" (Latency Optimization)
-
-* **Trigger:** OpenAI sends `input_audio_buffer.speech_started`.
-* **Action:** App **immediately** calls `AudioContext.stop()` and clears the buffer.
-* **Visual:** `ActiveOrb` switches from **Speaking** (Ripples) to **Listening** (Solid Frame).
+* **Agent:** Call **@edtech-prompt-calibrator**.
+* **Task:** "Review the 'Friend Loop' System Prompt. The current logic corrects *every* mistake. This is annoying. Define a 'Batching Strategy' (max 1 correction per turn) and a 'Social Calibration' rule (don't interrupt the user to correct them)."
 
 ---
 
-## 5. Critical Constraints
+## Final Deliverable Structure
 
-1. **Android Cleartext:** `app.json` MUST include `usesCleartextTraffic: true` or the AWS connection will fail silently.
-2. **No Vision Yet:** The "Processing" state and `vision.capture` events are **disabled** for this phase. Focus strictly on Audio Latency.
-3. **TSConfig:** Server must NOT extend `expo/tsconfig.base` to avoid module resolution errors.
+Once all agents have reported back, synthesize their findings into a **Consolidated Optimization Report**:
 
----
-
-## 6. Local Testing (Relay on Your Machine)
-
-To test the app against the relay running locally:
-
-1. **Start the relay** (from repo root):
-   ```bash
-   cd server
-   cp .env.example .env   # if needed; add OPENAI_API_KEY
-   npm run dev
-   ```
-   Server listens on `0.0.0.0:8082`.
-
-2. **Point the app at the local relay** in `app/App.tsx`:
-   * Set `USE_LOCAL_RELAY = true`.
-   * **Physical Android (USB):** Set `USE_ADB_REVERSE = true`, then run once with device connected: `adb reverse tcp:8082 tcp:8082`. App connects to `127.0.0.1:8082` on device (forwards to host).
-   * **Android Emulator:** Set `USE_ADB_REVERSE = false`; app uses `10.0.2.2:8082` when `LOCAL_RELAY_IP` is `'localhost'`.
-   * **iOS Simulator or physical device:** Set `LOCAL_RELAY_IP` to your computer’s LAN IP (e.g. `'192.168.1.100'`). Find it with `ipconfig getifaddr en0` (Mac) or `ifconfig` / network settings.
-
-3. **Run the app** (Expo dev build): `npx expo run:ios` or `npx expo run:android`.
-
-4. **Switch back to production:** Set `USE_LOCAL_RELAY = false` so the app uses the EC2 relay URL.
-
----
+1. **Critical Fixes (Do Now):** Bugs that will crash the demo or cause memory leaks.
+2. **Performance Wins:** Changes to ensure 60fps UI and Low Latency Audio.
+3. **Refined Code Blocks:** The final, corrected code for server and app incorporating all agent feedback.

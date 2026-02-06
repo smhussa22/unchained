@@ -18,8 +18,8 @@ export type OrbMode = 'idle' | 'listening' | 'speaking' | 'processing';
 interface ActiveOrbProps {
   mode: OrbMode;
   volumeLevel: SharedValue<number>; // 0-1 shared value from audio input
-  stabilityProgress?: number; // 0-1, how close to stable (for lock-on indicator)
-  isStable?: boolean; // True when device is fully stable (ready to capture)
+  stabilityProgress?: SharedValue<number>; // 0-1 SharedValue, how close to stable (for lock-on indicator)
+  isStable?: SharedValue<boolean>; // SharedValue, true when device is fully stable (ready to capture)
 }
 
 // Increased size for the viewfinder box
@@ -54,9 +54,15 @@ const SPRING_CONFIG = {
 export const ActiveOrb: React.FC<ActiveOrbProps> = ({
   mode,
   volumeLevel,
-  stabilityProgress = 0,
-  isStable = false,
+  stabilityProgress: stabilityProgressProp,
+  isStable: isStableProp,
 }) => {
+  // Default SharedValues for when props are not provided
+  const defaultStabilityProgress = useSharedValue(0);
+  const defaultIsStable = useSharedValue(false);
+  const stabilityProgress = stabilityProgressProp ?? defaultStabilityProgress;
+  const isStable = isStableProp ?? defaultIsStable;
+
   // Internal animation values
   const baseScale = useSharedValue(1);
   const opacity = useSharedValue(0.8);
@@ -71,7 +77,6 @@ export const ActiveOrb: React.FC<ActiveOrbProps> = ({
   const STABILITY_PROGRESS_COLOR = 'rgba(52, 199, 89, 0.6)'; // Semi-transparent green
 
   useEffect(() => {
-    'worklet';
     // Cancel previous animations by setting new values
     rippleScale.value = 1;
     rippleOpacity.value = 0;
@@ -187,59 +192,66 @@ export const ActiveOrb: React.FC<ActiveOrbProps> = ({
     };
   }, [mode]);
 
-  // Stability progress indicator style (circular progress around corners)
-  const stabilityIndicatorStyle = useAnimatedStyle(() => {
+  // Corner marker animated style - reads from SharedValues on UI thread
+  const cornerAnimatedStyle = useAnimatedStyle(() => {
     'worklet';
-    // Only show when listening and there's stability progress
-    const shouldShow = mode === 'listening' && stabilityProgress > 0;
+    const progress = stabilityProgress.value;
+    const stable = isStable.value;
+    const showStability = mode === 'listening' && progress > 0.5;
+
+    if (showStability) {
+      if (stable) {
+        return { borderColor: STABLE_GREEN };
+      }
+      // Interpolate opacity based on stability progress
+      const alpha = 0.3 + progress * 0.7;
+      return { borderColor: `rgba(52, 199, 89, ${alpha})` };
+    }
+    return { borderColor: 'rgba(255,255,255,0.3)' };
+  }, [mode]);
+
+  // Always-mounted ripple style with mode-based visibility
+  const rippleVisibilityStyle = useAnimatedStyle(() => {
+    'worklet';
     return {
-      opacity: shouldShow ? stabilityProgress : 0,
-      borderColor: isStable ? STABLE_GREEN : STABILITY_PROGRESS_COLOR,
-      borderWidth: isStable ? 6 : 4,
-      transform: [{ scale: isStable ? 1.02 : 1 }],
+      transform: [{ scale: rippleScale.value }],
+      opacity: mode === 'speaking' ? rippleOpacity.value : 0,
+      borderColor: ACTIVE_GREEN,
     };
-  }, [mode, stabilityProgress, isStable]);
+  }, [mode]);
 
-  // Corner marker style - turns green when stable
-  const getCornerStyle = (position: 'TL' | 'TR' | 'BL' | 'BR') => {
-    const baseStyle = {
-      TL: styles.cornerTL,
-      TR: styles.cornerTR,
-      BL: styles.cornerBL,
-      BR: styles.cornerBR,
-    }[position];
-
-    // Determine if corners should be highlighted (during stability lock-on)
-    const showStability = mode === 'listening' && stabilityProgress > 0.5;
-    const cornerColor = showStability
-      ? (isStable ? STABLE_GREEN : `rgba(52, 199, 89, ${0.3 + stabilityProgress * 0.7})`)
-      : 'rgba(255,255,255,0.3)';
-
-    return [baseStyle, { borderColor: cornerColor }];
-  };
+  // Always-mounted stability ring style with mode-based visibility
+  const stabilityRingVisibilityStyle = useAnimatedStyle(() => {
+    'worklet';
+    const progress = stabilityProgress.value;
+    const stable = isStable.value;
+    const shouldShow = mode === 'listening' && progress > 0;
+    return {
+      opacity: shouldShow ? progress : 0,
+      borderColor: stable ? STABLE_GREEN : STABILITY_PROGRESS_COLOR,
+      borderWidth: stable ? 6 : 4,
+      transform: [{ scale: stable ? 1.02 : 1 }],
+    };
+  }, [mode]);
 
   return (
     <View style={styles.container}>
-      {/* Stability Lock-On Indicator (Behind main box) */}
-      {mode === 'listening' && stabilityProgress > 0 && (
-        <Animated.View style={[styles.stabilityRing, stabilityIndicatorStyle]} />
-      )}
+      {/* Stability Lock-On Indicator (Behind main box) - always mounted */}
+      <Animated.View style={[styles.stabilityRing, stabilityRingVisibilityStyle]} />
 
-      {/* Ripple Effect (Speaking Only) */}
-      {mode === 'speaking' && (
-        <Animated.View style={[styles.box, rippleStyle]} />
-      )}
+      {/* Ripple Effect - always mounted, visibility controlled by animated style */}
+      <Animated.View style={[styles.box, rippleVisibilityStyle]} />
 
       {/* Main Square Crosshair Box */}
       <Animated.View style={[styles.box, boxStyle]}>
         {/* Subtle inner fill reacting to volume */}
         <Animated.View style={[styles.fill, fillStyle]} />
 
-        {/* Crosshair Corners (Visual Flourish) - Color changes with stability */}
-        <View style={getCornerStyle('TL')} />
-        <View style={getCornerStyle('TR')} />
-        <View style={getCornerStyle('BL')} />
-        <View style={getCornerStyle('BR')} />
+        {/* Crosshair Corners (Visual Flourish) - Color changes with stability via SharedValues */}
+        <Animated.View style={[styles.cornerTL, cornerAnimatedStyle]} />
+        <Animated.View style={[styles.cornerTR, cornerAnimatedStyle]} />
+        <Animated.View style={[styles.cornerBL, cornerAnimatedStyle]} />
+        <Animated.View style={[styles.cornerBR, cornerAnimatedStyle]} />
       </Animated.View>
     </View>
   );
