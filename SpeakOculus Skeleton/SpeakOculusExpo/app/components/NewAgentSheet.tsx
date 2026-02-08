@@ -9,7 +9,6 @@ import {
     Platform,
     KeyboardAvoidingView,
     Modal,
-    FlatList,
 } from 'react-native';
 import { BlurView } from 'expo-blur';
 import Animated, {
@@ -17,29 +16,21 @@ import Animated, {
     useAnimatedStyle,
     withSpring,
     withTiming,
-    withDelay,
-    withSequence,
-    interpolate,
     Easing,
-    FadeIn,
-    FadeInUp,
-    FadeInDown,
-    ZoomIn,
 } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import * as Haptics from 'expo-haptics';
-import { X, Sparkles, ChevronDown, Check } from 'lucide-react-native';
+import { X, Phone, ChevronDown, Check } from 'lucide-react-native';
 import { THEME } from '../theme';
 
 const { height: SCREEN_HEIGHT } = Dimensions.get('window');
 
 // Available languages for the dropdown
 const LANGUAGES = [
-    { id: 'english', label: 'English', flag: '🇺🇸' },
-    { id: 'french', label: 'French', flag: '🇫🇷' },
-    { id: 'spanish', label: 'Spanish', flag: '🇪🇸' },
-    { id: 'arabic', label: 'Arabic', flag: '🇸🇦' },
-    { id: 'japanese', label: 'Japanese', flag: '🇯🇵' },
+    { id: 'english', label: 'English', flag: '\u{1F1FA}\u{1F1F8}' },
+    { id: 'french', label: 'French', flag: '\u{1F1EB}\u{1F1F7}' },
+    { id: 'spanish', label: 'Spanish', flag: '\u{1F1EA}\u{1F1F8}' },
+    { id: 'arabic', label: 'Arabic', flag: '\u{1F1F8}\u{1F1E6}' },
+    { id: 'japanese', label: 'Japanese', flag: '\u{1F1EF}\u{1F1F5}' },
 ];
 
 interface AgentConfig {
@@ -67,72 +58,43 @@ const LanguageDropdown: React.FC<LanguageDropdownProps> = ({
 }) => {
     const [isOpen, setIsOpen] = useState(false);
 
-    // Animated chevron rotation
-    const chevronRotation = useSharedValue(0);
-    const buttonScale = useSharedValue(1);
-
     const selectedItem = LANGUAGES.find(l => l.label === selectedLanguage);
 
     const handleSelect = (language: typeof LANGUAGES[0]) => {
-        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
         onSelect(language.label);
         setIsOpen(false);
-        chevronRotation.value = withSpring(0, { damping: 15 });
     };
 
     const toggleDropdown = () => {
-        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-        const newState = !isOpen;
-        setIsOpen(newState);
-        chevronRotation.value = withSpring(newState ? 180 : 0, { damping: 15, stiffness: 200 });
+        setIsOpen(!isOpen);
     };
-
-    const handlePressIn = () => {
-        buttonScale.value = withSpring(0.97, { damping: 15, stiffness: 300 });
-    };
-
-    const handlePressOut = () => {
-        buttonScale.value = withSpring(1, { damping: 15, stiffness: 300 });
-    };
-
-    const buttonStyle = useAnimatedStyle(() => ({
-        transform: [{ scale: buttonScale.value }],
-    }));
-
-    const chevronStyle = useAnimatedStyle(() => ({
-        transform: [{ rotate: `${chevronRotation.value}deg` }],
-    }));
 
     return (
         <>
             {/* Dropdown Button */}
-            <Animated.View style={buttonStyle}>
-                <TouchableOpacity
-                    style={[
-                        styles.dropdownButton,
-                        isOpen && styles.dropdownButtonActive,
-                    ]}
-                    onPress={toggleDropdown}
-                    onPressIn={handlePressIn}
-                    onPressOut={handlePressOut}
-                    activeOpacity={1}
-                >
-                    {selectedItem ? (
-                        <View style={styles.selectedLanguage}>
-                            <Text style={styles.languageFlag}>{selectedItem.flag}</Text>
-                            <Text style={styles.languageLabel}>{selectedItem.label}</Text>
-                        </View>
-                    ) : (
-                        <Text style={styles.placeholderText}>Select a language</Text>
-                    )}
-                    <Animated.View style={chevronStyle}>
-                        <ChevronDown
-                            size={20}
-                            color={THEME.colors.textSecondary}
-                        />
-                    </Animated.View>
-                </TouchableOpacity>
-            </Animated.View>
+            <TouchableOpacity
+                style={[
+                    styles.dropdownButton,
+                    isOpen && styles.dropdownButtonActive,
+                ]}
+                onPress={toggleDropdown}
+                activeOpacity={0.7}
+            >
+                {selectedItem ? (
+                    <View style={styles.selectedLanguage}>
+                        <Text style={styles.languageFlag}>{selectedItem.flag}</Text>
+                        <Text style={styles.languageLabel}>{selectedItem.label}</Text>
+                    </View>
+                ) : (
+                    <Text style={styles.placeholderText}>Select a language</Text>
+                )}
+                <View style={{ transform: [{ rotate: isOpen ? '180deg' : '0deg' }] }}>
+                    <ChevronDown
+                        size={20}
+                        color={THEME.colors.textSecondary}
+                    />
+                </View>
+            </TouchableOpacity>
 
             {/* Dropdown Modal */}
             <Modal
@@ -195,11 +157,10 @@ export const NewAgentSheet: React.FC<NewAgentSheetProps> = ({
     const [name, setName] = useState('');
     const [language, setLanguage] = useState('');
 
-    // Animation values
+    // Sheet slide animation (functional navigation)
     const translateY = useSharedValue(SCREEN_HEIGHT);
     const backdropOpacity = useSharedValue(0);
 
-    // Animate sheet when visibility changes
     useEffect(() => {
         if (isVisible) {
             translateY.value = withSpring(0, {
@@ -216,9 +177,7 @@ export const NewAgentSheet: React.FC<NewAgentSheetProps> = ({
                 duration: 300,
                 easing: Easing.in(Easing.cubic),
             });
-            backdropOpacity.value = withTiming(0, {
-                duration: 200,
-            });
+            backdropOpacity.value = withTiming(0, { duration: 200 });
         }
     }, [isVisible]);
 
@@ -230,50 +189,8 @@ export const NewAgentSheet: React.FC<NewAgentSheetProps> = ({
         opacity: backdropOpacity.value,
     }));
 
-    // Start button animation
-    const startButtonScale = useSharedValue(1);
-    const startButtonStyle = useAnimatedStyle(() => ({
-        transform: [{ scale: startButtonScale.value }],
-    }));
-
-    const handleStartPressIn = useCallback(() => {
-        startButtonScale.value = withSpring(0.95, { damping: 15, stiffness: 300 });
-    }, []);
-
-    const handleStartPressOut = useCallback(() => {
-        startButtonScale.value = withSpring(1, { damping: 15, stiffness: 300 });
-    }, []);
-
-    // Close button animation
-    const closeButtonScale = useSharedValue(1);
-    const closeButtonRotation = useSharedValue(0);
-    const closeButtonStyle = useAnimatedStyle(() => ({
-        transform: [
-            { scale: closeButtonScale.value },
-            { rotate: `${closeButtonRotation.value}deg` },
-        ],
-    }));
-
-    const handleClosePressIn = useCallback(() => {
-        closeButtonScale.value = withSpring(0.85, { damping: 15, stiffness: 300 });
-        closeButtonRotation.value = withSpring(90, { damping: 12, stiffness: 200 });
-    }, []);
-
-    const handleClosePressOut = useCallback(() => {
-        closeButtonScale.value = withSpring(1, { damping: 15, stiffness: 300 });
-        closeButtonRotation.value = withSpring(0, { damping: 12, stiffness: 200 });
-    }, []);
-
     const handleStartSession = useCallback(() => {
         if (!name.trim() || !language) return;
-
-        // Success pulse animation
-        startButtonScale.value = withSequence(
-            withSpring(1.05, { damping: 10, stiffness: 400 }),
-            withSpring(1, { damping: 15, stiffness: 300 })
-        );
-
-        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
 
         onStartSession({
             name: name.trim(),
@@ -286,7 +203,6 @@ export const NewAgentSheet: React.FC<NewAgentSheetProps> = ({
     }, [name, language, onStartSession]);
 
     const handleClose = useCallback(() => {
-        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
         onClose();
     }, [onClose]);
 
@@ -316,87 +232,67 @@ export const NewAgentSheet: React.FC<NewAgentSheetProps> = ({
                         tint={THEME.blur.tint}
                         style={[styles.sheet, { paddingBottom: insets.bottom + 20 }]}
                     >
-                        {/* Handle - with subtle pulse animation */}
-                        <Animated.View
-                            style={styles.handle}
-                            entering={FadeIn.delay(100).duration(200)}
-                        />
+                        {/* Handle */}
+                        <View style={styles.handle} />
 
                         {/* Header */}
-                        <Animated.View
-                            style={styles.header}
-                            entering={FadeInDown.delay(150).duration(250).springify()}
-                        >
+                        <View style={styles.header}>
                             <Text style={styles.title}>Create New Tutor</Text>
-                            <Animated.View style={closeButtonStyle}>
-                                <TouchableOpacity
-                                    style={styles.closeButton}
-                                    onPress={handleClose}
-                                    onPressIn={handleClosePressIn}
-                                    onPressOut={handleClosePressOut}
-                                    activeOpacity={1}
-                                >
-                                    <X size={20} color={THEME.colors.textSecondary} />
-                                </TouchableOpacity>
-                            </Animated.View>
-                        </Animated.View>
+                            <TouchableOpacity
+                                style={styles.closeButton}
+                                onPress={handleClose}
+                                activeOpacity={0.7}
+                            >
+                                <X size={20} color={THEME.colors.textSecondary} />
+                            </TouchableOpacity>
+                        </View>
 
                         {/* Input Fields */}
                         <View style={styles.inputsContainer}>
                             {/* Name Input */}
-                            <Animated.View
-                                style={styles.inputWrapper}
-                                entering={FadeInUp.delay(200).duration(300).springify()}
-                            >
+                            <View style={styles.inputWrapper}>
                                 <Text style={styles.inputLabel}>Tutor Name</Text>
-                                <TextInput
-                                    style={styles.textInput}
-                                    placeholder="e.g., Sofia"
-                                    placeholderTextColor="rgba(255, 255, 255, 0.35)"
-                                    value={name}
-                                    onChangeText={setName}
-                                    autoCapitalize="words"
-                                    autoCorrect={false}
-                                />
-                            </Animated.View>
+                                <View style={styles.textInputContainer}>
+                                    <TextInput
+                                        style={styles.textInput}
+                                        placeholder="e.g., Sofia"
+                                        placeholderTextColor="rgba(255, 255, 255, 0.35)"
+                                        value={name}
+                                        onChangeText={setName}
+                                        autoCapitalize="words"
+                                        autoCorrect={false}
+                                    />
+                                </View>
+                            </View>
 
                             {/* Language Dropdown */}
-                            <Animated.View
-                                style={styles.inputWrapper}
-                                entering={FadeInUp.delay(280).duration(300).springify()}
-                            >
+                            <View style={styles.inputWrapper}>
                                 <Text style={styles.inputLabel}>Language</Text>
                                 <LanguageDropdown
                                     selectedLanguage={language}
                                     onSelect={setLanguage}
                                 />
-                            </Animated.View>
+                            </View>
                         </View>
 
                         {/* Start Session Button */}
-                        <Animated.View
-                            style={startButtonStyle}
-                            entering={FadeInUp.delay(360).duration(350).springify()}
+                        <TouchableOpacity
+                            style={[
+                                styles.startButton,
+                                !isFormValid && styles.startButtonDisabled,
+                            ]}
+                            onPress={handleStartSession}
+                            disabled={!isFormValid}
+                            activeOpacity={0.7}
                         >
-                            <TouchableOpacity
-                                style={[
-                                    styles.startButton,
-                                    !isFormValid && styles.startButtonDisabled,
-                                ]}
-                                onPress={handleStartSession}
-                                onPressIn={handleStartPressIn}
-                                onPressOut={handleStartPressOut}
-                                disabled={!isFormValid}
-                                activeOpacity={1}
-                            >
-                                <Sparkles
-                                    size={20}
-                                    color="#FFF"
-                                    style={{ marginRight: 8 }}
-                                />
-                                <Text style={styles.startButtonText}>Start Session</Text>
-                            </TouchableOpacity>
-                        </Animated.View>
+                            <Phone
+                                size={18}
+                                color="#FFF"
+                                fill="#FFF"
+                                style={{ marginRight: 8 }}
+                            />
+                            <Text style={styles.startButtonText}>Start Call</Text>
+                        </TouchableOpacity>
                     </BlurView>
                 </Animated.View>
             </KeyboardAvoidingView>
@@ -421,21 +317,12 @@ const styles = StyleSheet.create({
         width: '100%',
     },
     sheet: {
-        backgroundColor: 'rgba(30, 30, 30, 0.95)',
+        backgroundColor: 'rgba(28, 28, 30, 0.92)',
         borderTopLeftRadius: 32,
         borderTopRightRadius: 32,
         paddingHorizontal: THEME.spacing.lg,
         paddingTop: THEME.spacing.sm,
         overflow: 'hidden',
-        // Floating shadow
-        shadowColor: '#000',
-        shadowOffset: {
-            width: 0,
-            height: -4,
-        },
-        shadowOpacity: 0.3,
-        shadowRadius: 20,
-        elevation: 20,
     },
     handle: {
         width: 36,
@@ -477,15 +364,17 @@ const styles = StyleSheet.create({
         textTransform: 'uppercase',
         letterSpacing: 0.5,
     },
-    textInput: {
+    textInputContainer: {
         backgroundColor: 'rgba(255, 255, 255, 0.08)',
         borderRadius: THEME.borderRadius.md,
+        borderWidth: 1,
+        borderColor: 'rgba(255, 255, 255, 0.1)',
+    },
+    textInput: {
         paddingHorizontal: THEME.spacing.md,
         paddingVertical: Platform.OS === 'ios' ? 16 : 12,
         ...THEME.typography.body,
         color: THEME.colors.textPrimary,
-        borderWidth: 1,
-        borderColor: 'rgba(255, 255, 255, 0.1)',
     },
     startButton: {
         backgroundColor: THEME.colors.accent,
@@ -494,19 +383,9 @@ const styles = StyleSheet.create({
         flexDirection: 'row',
         alignItems: 'center',
         justifyContent: 'center',
-        // Glow effect
-        shadowColor: THEME.colors.accent,
-        shadowOffset: {
-            width: 0,
-            height: 4,
-        },
-        shadowOpacity: 0.4,
-        shadowRadius: 12,
-        elevation: 8,
     },
     startButtonDisabled: {
-        backgroundColor: 'rgba(52, 199, 89, 0.4)',
-        shadowOpacity: 0,
+        backgroundColor: 'rgba(52, 199, 89, 0.3)',
     },
     startButtonText: {
         ...THEME.typography.headline,
@@ -554,12 +433,8 @@ const styles = StyleSheet.create({
         maxWidth: 320,
         borderRadius: THEME.borderRadius.lg,
         overflow: 'hidden',
-        // Shadow
         shadowColor: '#000',
-        shadowOffset: {
-            width: 0,
-            height: 8,
-        },
+        shadowOffset: { width: 0, height: 8 },
         shadowOpacity: 0.4,
         shadowRadius: 24,
         elevation: 20,

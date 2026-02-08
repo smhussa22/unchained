@@ -6,36 +6,24 @@ import {
     TouchableOpacity,
     ScrollView,
     Platform,
+    Dimensions,
 } from 'react-native';
 import { BlurView } from 'expo-blur';
-import { ChevronLeft, BookOpen } from 'lucide-react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context'
-import * as Haptics from 'expo-haptics';
 import Animated, {
     useSharedValue,
     useAnimatedStyle,
-    withSpring,
     withTiming,
-    FadeIn,
-    FadeInUp,
-    FadeInDown,
-    SlideInRight,
-    SlideOutRight,
-    ZoomIn,
-    Layout,
+    withSpring,
     Easing,
+    runOnJS,
 } from 'react-native-reanimated';
+import { ChevronLeft, BookOpen } from 'lucide-react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { THEME } from '../theme';
 import { AgentConfig } from './CallHistoryScreen';
 import { GapWord, getGapWordsForAgent } from '../storage';
 
-// ============================================================================
-// TYPES
-// ============================================================================
-interface GapWordsScreenProps {
-    agent: AgentConfig;
-    onBack: () => void;
-}
+const SCREEN_WIDTH = Dimensions.get('window').width;
 
 // ============================================================================
 // HELPERS
@@ -75,57 +63,12 @@ const formatDate = (timestamp: number): string => {
 };
 
 // ============================================================================
-// ANIMATED WORD ITEM COMPONENT
+// TYPES
 // ============================================================================
-interface AnimatedWordItemProps {
-    word: GapWord;
-    index: number;
-    isLast: boolean;
+interface GapWordsScreenProps {
+    agent: AgentConfig;
+    onBack: () => void;
 }
-
-const AnimatedWordItem: React.FC<AnimatedWordItemProps> = ({ word, index, isLast }) => {
-    const scale = useSharedValue(1);
-    const bgOpacity = useSharedValue(0);
-
-    const animatedStyle = useAnimatedStyle(() => ({
-        transform: [{ scale: scale.value }],
-        backgroundColor: `rgba(52, 199, 89, ${bgOpacity.value})`,
-    }));
-
-    const handlePressIn = useCallback(() => {
-        scale.value = withSpring(0.98, { damping: 15, stiffness: 350 });
-        bgOpacity.value = withTiming(0.08, { duration: 100 });
-        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    }, []);
-
-    const handlePressOut = useCallback(() => {
-        scale.value = withSpring(1, { damping: 15, stiffness: 350 });
-        bgOpacity.value = withTiming(0, { duration: 150 });
-    }, []);
-
-    return (
-        <Animated.View
-            entering={FadeInUp.delay(300 + index * 40).duration(250).springify()}
-            layout={Layout.springify()}
-        >
-            <Animated.View style={[styles.wordItem, animatedStyle]}>
-                <TouchableOpacity
-                    onPressIn={handlePressIn}
-                    onPressOut={handlePressOut}
-                    activeOpacity={1}
-                    style={styles.wordItemTouchable}
-                >
-                    <View style={styles.wordContent}>
-                        <Text style={styles.targetWord}>{word.target_word}</Text>
-                        <Text style={styles.nativeWord}>{word.native_word}</Text>
-                    </View>
-                    <Text style={styles.wordTimestamp}>{formatDate(word.timestamp)}</Text>
-                </TouchableOpacity>
-            </Animated.View>
-            {!isLast && <View style={styles.separator} />}
-        </Animated.View>
-    );
-};
 
 // ============================================================================
 // COMPONENT
@@ -138,10 +81,25 @@ export const GapWordsScreen: React.FC<GapWordsScreenProps> = ({
     const [gapWords, setGapWords] = useState<GapWord[]>([]);
     const [loading, setLoading] = useState(true);
 
+    // Slide animation: 0 = visible (on-screen), 1 = off-screen right
+    const slide = useSharedValue(1);
+
+    useEffect(() => {
+        // Spring in: screen arrives with elastic momentum (iOS-native feel)
+        slide.value = withSpring(0, {
+            damping: 22,
+            stiffness: 250,
+            mass: 0.8,
+        });
+    }, []);
+
+    const slideStyle = useAnimatedStyle(() => ({
+        transform: [{ translateX: slide.value * SCREEN_WIDTH }],
+    }));
+
     useEffect(() => {
         const loadWords = async () => {
             const words = await getGapWordsForAgent(agent.name);
-            // Sort by most recent first
             words.sort((a, b) => b.timestamp - a.timestamp);
             setGapWords(words);
             setLoading(false);
@@ -149,37 +107,21 @@ export const GapWordsScreen: React.FC<GapWordsScreenProps> = ({
         loadWords();
     }, [agent.name]);
 
-    // Back button press animation
-    const backButtonScale = useSharedValue(1);
-
-    const backButtonStyle = useAnimatedStyle(() => ({
-        transform: [{ scale: backButtonScale.value }],
-    }));
-
-    const handleBackPressIn = useCallback(() => {
-        backButtonScale.value = withSpring(0.92, { damping: 15, stiffness: 300 });
-    }, []);
-
-    const handleBackPressOut = useCallback(() => {
-        backButtonScale.value = withSpring(1, { damping: 15, stiffness: 300 });
-    }, []);
-
     const handleBack = useCallback(() => {
-        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-        onBack();
+        slide.value = withTiming(1, {
+            duration: 250,
+            easing: Easing.in(Easing.cubic),
+        });
+        // Delay unmount until animation finishes
+        setTimeout(onBack, 250);
     }, [onBack]);
 
     return (
-        <Animated.View
-            style={styles.container}
-            entering={SlideInRight.duration(300).springify().damping(18)}
-            exiting={SlideOutRight.duration(250)}
-        >
+        <Animated.View style={[styles.container, slideStyle]}>
             {/* Background */}
-            {Platform.OS !== 'android' && (
+            {Platform.OS !== 'android' ? (
                 <BlurView intensity={THEME.blur.intensity} tint={THEME.blur.tint} style={StyleSheet.absoluteFill} />
-            )}
-            {Platform.OS === 'android' && (
+            ) : (
                 <View style={[StyleSheet.absoluteFill, { backgroundColor: THEME.colors.surface }]} />
             )}
 
@@ -191,77 +133,57 @@ export const GapWordsScreen: React.FC<GapWordsScreenProps> = ({
                 showsVerticalScrollIndicator={false}
             >
                 {/* Header with Back Button */}
-                <Animated.View
-                    style={styles.header}
-                    entering={FadeInDown.delay(100).duration(250).springify()}
-                >
-                    <Animated.View style={backButtonStyle}>
-                        <TouchableOpacity
-                            style={styles.backButton}
-                            onPress={handleBack}
-                            onPressIn={handleBackPressIn}
-                            onPressOut={handleBackPressOut}
-                            activeOpacity={1}
-                        >
-                            <ChevronLeft size={28} color={THEME.colors.accent} />
-                            <Text style={styles.backText}>Back</Text>
-                        </TouchableOpacity>
-                    </Animated.View>
-                </Animated.View>
+                <View style={styles.header}>
+                    <TouchableOpacity
+                        style={styles.backButton}
+                        onPress={handleBack}
+                        activeOpacity={0.7}
+                    >
+                        <ChevronLeft size={28} color={THEME.colors.accent} />
+                        <Text style={styles.backText}>Back</Text>
+                    </TouchableOpacity>
+                </View>
 
-                {/* Agent Card - Zoom In Animation */}
-                <Animated.View
-                    style={styles.agentCard}
-                    entering={ZoomIn.delay(150).duration(350).springify().damping(14)}
-                >
+                {/* Agent Card */}
+                <View style={styles.agentCard}>
                     <View style={[styles.avatar, { backgroundColor: getAvatarColor(agent.language) }]}>
                         <Text style={styles.avatarText}>{getInitials(agent.name)}</Text>
                     </View>
                     <Text style={styles.agentName}>{agent.name}</Text>
                     <Text style={styles.agentLanguage}>{agent.language} Tutor</Text>
-                </Animated.View>
+                </View>
 
                 {/* Section Title */}
-                <Animated.Text
-                    style={styles.sectionTitle}
-                    entering={FadeIn.delay(250).duration(200)}
-                >
-                    Missed Words
-                </Animated.Text>
+                <Text style={styles.sectionTitle}>Missed Words</Text>
 
                 {/* Gap Words List */}
                 {loading ? (
-                    <Animated.View
-                        style={styles.emptyState}
-                        entering={FadeIn.duration(200)}
-                    >
+                    <View style={styles.emptyState}>
                         <Text style={styles.emptyStateText}>Loading...</Text>
-                    </Animated.View>
+                    </View>
                 ) : gapWords.length === 0 ? (
-                    <Animated.View
-                        style={styles.emptyState}
-                        entering={FadeInUp.delay(300).duration(400).springify()}
-                    >
+                    <View style={styles.emptyState}>
                         <BookOpen size={48} color={THEME.colors.textSecondary} style={{ marginBottom: 16 }} />
                         <Text style={styles.emptyStateTitle}>No Missed Words Yet</Text>
                         <Text style={styles.emptyStateText}>
                             Words you miss during conversations with {agent.name} will appear here.
                         </Text>
-                    </Animated.View>
+                    </View>
                 ) : (
-                    <Animated.View
-                        style={styles.wordList}
-                        entering={FadeInUp.delay(200).duration(300)}
-                    >
+                    <View style={styles.wordList}>
                         {gapWords.map((word, index) => (
-                            <AnimatedWordItem
-                                key={`${word.native_word}-${word.timestamp}`}
-                                word={word}
-                                index={index}
-                                isLast={index === gapWords.length - 1}
-                            />
+                            <View key={`${word.native_word}-${word.timestamp}`}>
+                                <View style={styles.wordItem}>
+                                    <View style={styles.wordContent}>
+                                        <Text style={styles.targetWord}>{word.target_word}</Text>
+                                        <Text style={styles.nativeWord}>{word.native_word}</Text>
+                                    </View>
+                                    <Text style={styles.wordTimestamp}>{formatDate(word.timestamp)}</Text>
+                                </View>
+                                {index < gapWords.length - 1 && <View style={styles.separator} />}
+                            </View>
                         ))}
-                    </Animated.View>
+                    </View>
                 )}
             </ScrollView>
         </Animated.View>
@@ -275,6 +197,7 @@ const styles = StyleSheet.create({
     container: {
         ...StyleSheet.absoluteFillObject,
         zIndex: 25,
+        backgroundColor: '#000000',
     },
     contentContainer: {
         paddingHorizontal: THEME.spacing.md,
@@ -331,10 +254,6 @@ const styles = StyleSheet.create({
         overflow: 'hidden',
     },
     wordItem: {
-        borderRadius: THEME.borderRadius.sm,
-        overflow: 'hidden',
-    },
-    wordItemTouchable: {
         flexDirection: 'row',
         alignItems: 'center',
         justifyContent: 'space-between',

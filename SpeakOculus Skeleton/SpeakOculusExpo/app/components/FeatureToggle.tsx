@@ -1,5 +1,10 @@
-import React from 'react';
-import { TouchableOpacity, Text, StyleSheet, View } from 'react-native';
+import React, { useCallback } from 'react';
+import { Pressable, Text, StyleSheet } from 'react-native';
+import Animated, {
+    useSharedValue,
+    useAnimatedStyle,
+    withSpring,
+} from 'react-native-reanimated';
 import { LucideIcon } from 'lucide-react-native';
 import { THEME } from '../theme';
 
@@ -11,38 +16,63 @@ interface FeatureToggleProps {
 }
 
 export const FeatureToggle = ({ icon: Icon, label, isActive, onPress }: FeatureToggleProps) => {
+    const scale = useSharedValue(1);
+
+    const handlePress = useCallback(() => {
+        onPress();
+    }, [onPress]);
+
+    const animatedStyle = useAnimatedStyle(() => {
+        'worklet';
+        return { transform: [{ scale: scale.value }] };
+    });
+
     return (
-        <TouchableOpacity
-            style={[styles.container, isActive ? styles.active : styles.inactive]}
-            onPress={onPress}
-            activeOpacity={0.8}
+        <Pressable
+            onPressIn={() => {
+                scale.value = withSpring(0.93, { damping: 15, stiffness: 400 });
+            }}
+            onPressOut={() => {
+                scale.value = withSpring(1, { damping: 12, stiffness: 200 });
+            }}
+            onPress={handlePress}
+            style={styles.pressable}
         >
-            <Icon
-                size={16}
-                color={isActive ? THEME.colors.iconActive : THEME.colors.iconDefault}
-            />
-            <Text style={[styles.label, isActive ? styles.labelActive : styles.labelInactive]}>
-                {label}
-            </Text>
-        </TouchableOpacity>
+            <Animated.View
+                style={[
+                    styles.container,
+                    isActive && styles.containerActive,
+                    animatedStyle,
+                ]}
+            >
+                <Icon
+                    size={15}
+                    color={isActive ? THEME.colors.iconActive : THEME.colors.iconDefault}
+                    strokeWidth={2}
+                />
+                <Text style={[styles.label, isActive ? styles.labelActive : styles.labelInactive]}>
+                    {label}
+                </Text>
+            </Animated.View>
+        </Pressable>
     );
 };
 
 const styles = StyleSheet.create({
-    container: {
+    pressable: {
         flex: 1,
+    },
+    container: {
         flexDirection: 'row',
         alignItems: 'center',
         justifyContent: 'center',
-        paddingVertical: THEME.spacing.sm,
+        paddingVertical: 10,
         paddingHorizontal: THEME.spacing.sm,
         borderRadius: THEME.borderRadius.xl,
-        gap: THEME.spacing.xs,
-    },
-    inactive: {
+        gap: 6,
         backgroundColor: THEME.colors.controlBackground,
     },
-    active: {
+    containerActive: {
         backgroundColor: THEME.colors.controlActive,
     },
     label: {

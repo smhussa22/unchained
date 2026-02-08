@@ -24,14 +24,21 @@ export const THEME = {
         background: '#000000',
         surface: 'rgba(30, 30, 30, 0.85)',
         surfaceHighlight: 'rgba(255, 255, 255, 0.1)',
+        surfaceElevated: 'rgba(44, 44, 46, 0.92)',
         textPrimary: '#FFFFFF',
         textSecondary: 'rgba(255, 255, 255, 0.6)',
+        textTertiary: 'rgba(255, 255, 255, 0.35)',
         accent: '#34C759', // Green for connected/active
+        accentDim: 'rgba(52, 199, 89, 0.25)',
+        accentGlow: 'rgba(52, 199, 89, 0.4)',
+        accentTeal: '#30D5C8',
         destructive: '#FF3B30', // Red for hangup
         iconDefault: '#FFFFFF',
         iconActive: '#000000',
         controlBackground: '#2C2C2E',
         controlActive: '#FFFFFF',
+        glassBorder: 'rgba(255, 255, 255, 0.12)',
+        glassHighlight: 'rgba(255, 255, 255, 0.06)',
     },
     spacing: {
         xs: 4,

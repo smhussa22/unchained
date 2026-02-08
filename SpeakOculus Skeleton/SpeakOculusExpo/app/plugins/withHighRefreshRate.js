@@ -60,21 +60,20 @@ const withHighRefreshRate = (config) => {
     }
 `;
 
-    // Find the last closing brace and insert before it
+    // Call setHighRefreshRate() in onCreate after super.onCreate
+    // IMPORTANT: Must inject the call BEFORE adding the method body,
+    // otherwise the includes check sees "setHighRefreshRate()" in the method definition
+    mainActivity.contents = mainActivity.contents.replace(
+      /(super\.onCreate\([^)]*\))/,
+      '$1\n        setHighRefreshRate()'
+    );
+
+    // Find the last closing brace and insert method before it
     const lastBraceIndex = mainActivity.contents.lastIndexOf('}');
     mainActivity.contents =
       mainActivity.contents.slice(0, lastBraceIndex) +
       highRefreshMethod + '\n' +
       mainActivity.contents.slice(lastBraceIndex);
-
-    // Call setHighRefreshRate() in onCreate after super.onCreate
-    // Handle both super.onCreate(savedInstanceState) and super.onCreate(null)
-    if (!mainActivity.contents.includes('setHighRefreshRate()')) {
-      mainActivity.contents = mainActivity.contents.replace(
-        /(super\.onCreate\([^)]*\))/,
-        '$1\n        setHighRefreshRate()'
-      );
-    }
 
     return config;
   });

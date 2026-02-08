@@ -30,49 +30,18 @@ export const ControlSheet = ({
     return (
         <View style={styles.container}>
             <BlurView intensity={THEME.blur.intensity} tint={THEME.blur.tint} style={styles.blurContainer}>
-                {/* Handle */}
                 <View style={styles.handle} />
 
-                {/* Circle Buttons Row */}
                 <View style={styles.row}>
-                    <CircleButton
-                        icon={Globe}
-                        label="languages"
-                        onPress={() => { }}
-                    />
-                    <CircleButton
-                        icon={isMuted ? MicOff : Mic}
-                        label="mute"
-                        isActive={isMuted}
-                        onPress={onToggleMute}
-                    />
-                    <CircleButton
-                        icon={Camera}
-                        label="flip"
-                        onPress={onFlipCamera}
-                    />
-                    <CircleButton
-                        icon={PhoneOff}
-                        label="end"
-                        variant="destructive"
-                        onPress={onDisconnect}
-                    />
+                    <CircleButton icon={Globe} label="languages" onPress={() => { }} />
+                    <CircleButton icon={isMuted ? MicOff : Mic} label="mute" isActive={isMuted} onPress={onToggleMute} />
+                    <CircleButton icon={Camera} label="flip" onPress={onFlipCamera} />
+                    <CircleButton icon={PhoneOff} label="end" variant="destructive" onPress={onDisconnect} />
                 </View>
 
-                {/* Feature Toggles Row */}
                 <View style={styles.featuresRow}>
-                    <FeatureToggle
-                        icon={isCameraOn ? Video : VideoOff}
-                        label={isCameraOn ? "Camera On" : "Camera Off"}
-                        isActive={isCameraOn}
-                        onPress={onToggleCamera}
-                    />
-                    <FeatureToggle
-                        icon={AudioWaveform}
-                        label="Noise Isolation"
-                        isActive={isNoiseIsolationOn}
-                        onPress={onToggleNoiseIsolation}
-                    />
+                    <FeatureToggle icon={isCameraOn ? Video : VideoOff} label={isCameraOn ? "Camera On" : "Camera Off"} isActive={isCameraOn} onPress={onToggleCamera} />
+                    <FeatureToggle icon={AudioWaveform} label="Noise Isolation" isActive={isNoiseIsolationOn} onPress={onToggleNoiseIsolation} />
                 </View>
             </BlurView>
         </View>
@@ -87,19 +56,10 @@ const styles = StyleSheet.create({
     },
     blurContainer: {
         padding: THEME.spacing.lg,
-        backgroundColor: 'rgba(30, 30, 30, 0.90)', // Reduced transparency (more opaque)
-        gap: THEME.spacing.xl,
-        borderRadius: 48, // Increased for a smoother, rounder box
+        backgroundColor: 'rgba(28, 28, 30, 0.88)',
+        gap: THEME.spacing.lg,
+        borderRadius: 44,
         overflow: 'hidden',
-        // Floating shadow
-        shadowColor: "#000",
-        shadowOffset: {
-            width: 0,
-            height: 4,
-        },
-        shadowOpacity: 0.3,
-        shadowRadius: 10,
-        elevation: 10,
     },
     handle: {
         width: 36,
@@ -116,7 +76,7 @@ const styles = StyleSheet.create({
     },
     featuresRow: {
         flexDirection: 'row',
-        gap: THEME.spacing.md,
-        marginBottom: THEME.spacing.md,
+        gap: THEME.spacing.sm,
+        marginBottom: THEME.spacing.sm,
     },
 });

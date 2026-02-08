@@ -1,0 +1,20 @@
+# Environment / secrets
+.env
+server/.env
+
+# Dependencies
+node_modules/
+
+# Build artifacts
+dist/
+server/dist/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Expo
+.expo/
+
+# Claude
+.claude/

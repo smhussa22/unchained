@@ -1,26 +1,14 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, ScrollView, Platform } from 'react-native';
 import { BlurView } from 'expo-blur';
-import { Link, Video, Info, MinusCircle } from 'lucide-react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import * as Haptics from 'expo-haptics';
 import Animated, {
     useSharedValue,
     useAnimatedStyle,
-    withSpring,
     withTiming,
-    withDelay,
     interpolate,
-    Easing,
-    runOnJS,
-    FadeIn,
-    FadeOut,
-    FadeInUp,
-    FadeInDown,
-    SlideInLeft,
-    SlideInUp,
-    Layout,
 } from 'react-native-reanimated';
+import { Link, Video, Info, MinusCircle } from 'lucide-react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { THEME } from '../theme';
 import { NewAgentSheet } from './NewAgentSheet';
 
@@ -115,12 +103,10 @@ export const generateSystemPrompt = (name: string, language: string): string => 
 };
 
 // ============================================================================
-// ANIMATED CALL ROW COMPONENT
+// CALL ROW COMPONENT
 // ============================================================================
-interface AnimatedCallRowProps {
+interface CallRowProps {
     item: CallHistoryItem;
-    index: number;
-    globalIndex: number;  // For staggered entrance delay
     isEditMode: boolean;
     onRedial: (item: CallHistoryItem) => void;
     onDelete: (id: string) => void;
@@ -128,141 +114,42 @@ interface AnimatedCallRowProps {
     isLast: boolean;
 }
 
-// Spring config optimized for Android (snappier, less bounce)
-const SPRING_CONFIG = {
-    damping: 18,
-    stiffness: 180,
-    mass: 0.8,
-};
-
-const AnimatedTouchable = Animated.createAnimatedComponent(TouchableOpacity);
-
-const AnimatedCallRow: React.FC<AnimatedCallRowProps> = ({
+const CallRow: React.FC<CallRowProps> = ({
     item,
-    index,
-    globalIndex,
     isEditMode,
     onRedial,
     onDelete,
     onViewGapWords,
     isLast,
 }) => {
-    // Animated values
-    const editModeProgress = useSharedValue(isEditMode ? 1 : 0);
-    const rowScale = useSharedValue(1);
-    const isDeleting = useSharedValue(false);
-    const deleteProgress = useSharedValue(1);
+    const avatarColor = getAvatarColor(item.agentConfig.language);
+    const editProgress = useSharedValue(isEditMode ? 1 : 0);
 
-    // Info button animation
-    const infoButtonScale = useSharedValue(1);
-    const infoButtonBgOpacity = useSharedValue(0);
-
-    // Animate when edit mode changes
     useEffect(() => {
-        editModeProgress.value = withSpring(isEditMode ? 1 : 0, SPRING_CONFIG);
+        editProgress.value = withTiming(isEditMode ? 1 : 0, { duration: 250 });
     }, [isEditMode]);
 
-    // Row content shifts right when delete button appears
-    const rowContentStyle = useAnimatedStyle(() => {
-        return {
-            transform: [
-                { translateX: interpolate(editModeProgress.value, [0, 1], [0, 34]) },
-            ],
-        };
-    });
-
-    // Delete button slides in from left
-    const deleteButtonStyle = useAnimatedStyle(() => {
-        return {
-            opacity: editModeProgress.value,
-            transform: [
-                { translateX: interpolate(editModeProgress.value, [0, 1], [-34, 0]) },
-                { scale: interpolate(editModeProgress.value, [0, 0.5, 1], [0.5, 1.1, 1]) },
-            ],
-        };
-    });
-
-    // Row press animation
-    const rowPressStyle = useAnimatedStyle(() => {
-        return {
-            transform: [{ scale: rowScale.value }],
-        };
-    });
-
-    // Delete animation (shrink + fade)
-    const deleteAnimStyle = useAnimatedStyle(() => {
-        return {
-            opacity: deleteProgress.value,
-            transform: [
-                { scaleY: deleteProgress.value },
-            ],
-            height: interpolate(deleteProgress.value, [0, 1], [0, 68]),
-            overflow: 'hidden' as const,
-        };
-    });
-
-    const handlePressIn = () => {
-        if (!isEditMode) {
-            rowScale.value = withSpring(0.97, { damping: 15, stiffness: 300 });
-        }
-    };
-
-    const handlePressOut = () => {
-        rowScale.value = withSpring(1, { damping: 15, stiffness: 300 });
-    };
-
-    // Info button animated style
-    const infoButtonStyle = useAnimatedStyle(() => ({
-        transform: [{ scale: infoButtonScale.value }],
-        backgroundColor: `rgba(52, 199, 89, ${infoButtonBgOpacity.value})`,
+    const deleteStyle = useAnimatedStyle(() => ({
+        width: interpolate(editProgress.value, [0, 1], [0, 30]),
+        marginRight: interpolate(editProgress.value, [0, 1], [0, 8]),
+        opacity: editProgress.value,
+        overflow: 'hidden' as const,
     }));
 
-    const handleInfoPressIn = () => {
-        infoButtonScale.value = withSpring(0.85, { damping: 12, stiffness: 400 });
-        infoButtonBgOpacity.value = withTiming(0.3, { duration: 100 });
-    };
-
-    const handleInfoPressOut = () => {
-        infoButtonScale.value = withSpring(1.1, { damping: 10, stiffness: 350 });
-        infoButtonBgOpacity.value = withTiming(0, { duration: 200 });
-        // Settle back to 1
-        setTimeout(() => {
-            infoButtonScale.value = withSpring(1, { damping: 15, stiffness: 300 });
-        }, 50);
-    };
-
     const handleDelete = () => {
-        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
-        isDeleting.value = true;
-        deleteProgress.value = withTiming(0, {
-            duration: 250,
-            easing: Easing.out(Easing.cubic),
-        }, (finished) => {
-            if (finished) {
-                runOnJS(onDelete)(item.id);
-            }
-        });
+        onDelete(item.id);
     };
-    // Staggered entrance delay (30ms per row, max 300ms)
-    const entranceDelay = Math.min(globalIndex * 30, 300);
 
     return (
-        <Animated.View
-            style={deleteAnimStyle}
-            layout={Layout.springify().damping(18).stiffness(180)}
-            entering={FadeInUp.delay(entranceDelay).duration(300).springify().damping(15)}
-        >
-            <AnimatedTouchable
-                style={[styles.callItem, rowPressStyle]}
+        <View>
+            <TouchableOpacity
+                style={styles.callItem}
                 onPress={() => !isEditMode && onRedial(item)}
-                onPressIn={handlePressIn}
-                onPressOut={handlePressOut}
-                activeOpacity={1}
+                activeOpacity={0.7}
             >
-                {/* Delete button - always rendered but animated */}
-                <Animated.View style={[styles.deleteButtonContainer, deleteButtonStyle]}>
+                {/* Delete button - always mounted, animated in/out */}
+                <Animated.View style={deleteStyle} pointerEvents={isEditMode ? 'auto' : 'none'}>
                     <TouchableOpacity
-                        style={styles.deleteButton}
                         onPress={handleDelete}
                         hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
                     >
@@ -270,53 +157,44 @@ const AnimatedCallRow: React.FC<AnimatedCallRowProps> = ({
                     </TouchableOpacity>
                 </Animated.View>
 
-                {/* Row content - shifts right in edit mode */}
-                <Animated.View style={[styles.rowContent, rowContentStyle]}>
-                    <View style={styles.avatarContainer}>
-                        <View style={[
-                            styles.avatarPlaceholder,
-                            { backgroundColor: getAvatarColor(item.agentConfig.language) }
-                        ]}>
-                            <Text style={styles.avatarInitials}>
-                                {getInitials(item.agentConfig.name)}
-                            </Text>
-                        </View>
+                {/* Avatar */}
+                <View style={styles.avatarContainer}>
+                    <View style={[styles.avatarPlaceholder, { backgroundColor: avatarColor }]}>
+                        <Text style={styles.avatarInitials}>
+                            {getInitials(item.agentConfig.name)}
+                        </Text>
                     </View>
+                </View>
 
-                    <View style={styles.callDetails}>
-                        <Text style={styles.callerName}>{item.agentConfig.name}</Text>
-                        <View style={styles.callTypeContainer}>
-                            <Video size={12} color={THEME.colors.textSecondary} style={{ marginRight: 4 }} />
-                            <Text style={styles.callSubtitle}>
-                                {item.agentConfig.language} Tutor
-                            </Text>
-                        </View>
+                {/* Details */}
+                <View style={styles.callDetails}>
+                    <Text style={styles.callerName}>{item.agentConfig.name}</Text>
+                    <View style={styles.callTypeContainer}>
+                        <Video size={12} color={THEME.colors.textSecondary} style={{ marginRight: 4 }} />
+                        <Text style={styles.callSubtitle}>
+                            {item.agentConfig.language} Tutor
+                        </Text>
                     </View>
+                </View>
 
-                    <View style={styles.callMeta}>
-                        <Text style={styles.timeText}>{formatTime(item.timestamp)}</Text>
-                        <Animated.View style={[styles.infoButton, infoButtonStyle]}>
-                            <TouchableOpacity
-                                onPress={(e) => {
-                                    e.stopPropagation();
-                                    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                                    onViewGapWords(item.agentConfig);
-                                }}
-                                onPressIn={handleInfoPressIn}
-                                onPressOut={handleInfoPressOut}
-                                activeOpacity={1}
-                                style={styles.infoButtonInner}
-                            >
-                                <Info size={18} color={THEME.colors.textSecondary} />
-                            </TouchableOpacity>
-                        </Animated.View>
-                    </View>
-                </Animated.View>
-            </AnimatedTouchable>
+                {/* Meta */}
+                <View style={styles.callMeta}>
+                    <Text style={styles.timeText}>{formatTime(item.timestamp)}</Text>
+                    <TouchableOpacity
+                        style={styles.infoButton}
+                        onPress={() => {
+                            onViewGapWords(item.agentConfig);
+                        }}
+                        activeOpacity={0.7}
+                    >
+                        <Info size={18} color={THEME.colors.textSecondary} />
+                    </TouchableOpacity>
+                </View>
+            </TouchableOpacity>
 
-            {/* Separator */}
+            {/* Thin separator line (skip last item) */}
             {!isLast && <View style={styles.separator} />}
-        </Animated.View>
+        </View>
     );
 };
 
@@ -333,26 +211,8 @@ export const CallHistoryScreen: React.FC<CallHistoryScreenProps> = ({
     const [isNewAgentSheetVisible, setIsNewAgentSheetVisible] = useState(false);
     const [isEditMode, setIsEditMode] = useState(false);
 
-    // Animated button scales
-    const editButtonScale = useSharedValue(1);
-    const createLinkScale = useSharedValue(1);
-    const newAgentScale = useSharedValue(1);
-
-    // Animated styles for buttons
-    const editButtonStyle = useAnimatedStyle(() => ({
-        transform: [{ scale: editButtonScale.value }],
-    }));
-    const createLinkStyle = useAnimatedStyle(() => ({
-        transform: [{ scale: createLinkScale.value }],
-    }));
-    const newAgentStyle = useAnimatedStyle(() => ({
-        transform: [{ scale: newAgentScale.value }],
-    }));
-
     // Handle creating a new agent and starting a session
     const handleStartSession = useCallback((config: { name: string; language: string }) => {
-        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-
         const agentConfig: AgentConfig = {
             name: config.name,
             language: config.language,
@@ -365,53 +225,26 @@ export const CallHistoryScreen: React.FC<CallHistoryScreenProps> = ({
 
     // Handle redialing a previous agent
     const handleRedial = useCallback((item: CallHistoryItem) => {
-        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
         onConnect(item.agentConfig);
     }, [onConnect]);
 
     // Handle viewing gap words for an agent
     const handleViewGapWords = useCallback((agent: AgentConfig) => {
-        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
         onViewGapWords(agent);
     }, [onViewGapWords]);
 
     // Open new agent sheet
     const handleNewAgentPress = useCallback(() => {
-        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
         setIsNewAgentSheetVisible(true);
     }, []);
 
     // Toggle edit mode
     const handleToggleEditMode = useCallback(() => {
-        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
         setIsEditMode(prev => !prev);
-    }, []);
-
-    // Button press handlers
-    const handleEditPressIn = useCallback(() => {
-        editButtonScale.value = withSpring(0.92, { damping: 15, stiffness: 350 });
-    }, []);
-    const handleEditPressOut = useCallback(() => {
-        editButtonScale.value = withSpring(1, { damping: 15, stiffness: 350 });
-    }, []);
-
-    const handleCreateLinkPressIn = useCallback(() => {
-        createLinkScale.value = withSpring(0.94, { damping: 15, stiffness: 350 });
-    }, []);
-    const handleCreateLinkPressOut = useCallback(() => {
-        createLinkScale.value = withSpring(1, { damping: 15, stiffness: 350 });
-    }, []);
-
-    const handleNewAgentPressIn = useCallback(() => {
-        newAgentScale.value = withSpring(0.94, { damping: 15, stiffness: 350 });
-    }, []);
-    const handleNewAgentPressOut = useCallback(() => {
-        newAgentScale.value = withSpring(1, { damping: 15, stiffness: 350 });
     }, []);
 
     // Delete a call history item
     const handleDelete = useCallback((itemId: string) => {
-        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
         onDeleteItem(itemId);
     }, [onDeleteItem]);
 
@@ -420,12 +253,11 @@ export const CallHistoryScreen: React.FC<CallHistoryScreenProps> = ({
 
     return (
         <View style={styles.container}>
-            {/* Background Blur */}
-            {Platform.OS !== 'android' && (
-                <BlurView intensity={THEME.blur.intensity} tint={THEME.blur.tint} style={StyleSheet.absoluteFill} />
-            )}
-            {Platform.OS === 'android' && (
-                <View style={[StyleSheet.absoluteFill, { backgroundColor: THEME.colors.surface }]} />
+            {/* Blurred camera background (like FaceTime) */}
+            {Platform.OS !== 'android' ? (
+                <BlurView intensity={20} tint="dark" style={StyleSheet.absoluteFill} />
+            ) : (
+                <View style={[StyleSheet.absoluteFill, { backgroundColor: 'rgba(0, 0, 0, 0.85)' }]} />
             )}
 
             <ScrollView
@@ -436,129 +268,79 @@ export const CallHistoryScreen: React.FC<CallHistoryScreenProps> = ({
                 showsVerticalScrollIndicator={false}
             >
                 {/* Header */}
-                <Animated.View
-                    style={styles.header}
-                    entering={FadeInDown.duration(300).springify()}
-                >
-                    <Animated.View style={editButtonStyle}>
-                        <TouchableOpacity
-                            onPress={handleToggleEditMode}
-                            onPressIn={handleEditPressIn}
-                            onPressOut={handleEditPressOut}
-                            activeOpacity={1}
-                        >
-                            <Animated.Text
-                                style={[styles.editText, isEditMode && styles.editTextActive]}
-                                entering={FadeIn.duration(150)}
-                                key={isEditMode ? 'done' : 'edit'}
-                            >
-                                {isEditMode ? 'Done' : 'Edit'}
-                            </Animated.Text>
-                        </TouchableOpacity>
-                    </Animated.View>
-                </Animated.View>
+                <View style={styles.header}>
+                    <TouchableOpacity onPress={handleToggleEditMode} activeOpacity={0.7}>
+                        <Text style={[styles.editText, isEditMode && styles.editTextActive]}>
+                            {isEditMode ? 'Done' : 'Edit'}
+                        </Text>
+                    </TouchableOpacity>
+                </View>
 
                 {/* Title */}
-                <Animated.Text
-                    style={styles.pageTitle}
-                    entering={FadeInDown.delay(50).duration(350).springify()}
-                >
-                    LangTime
-                </Animated.Text>
+                <Text style={styles.pageTitle}>FaceTime</Text>
 
                 {/* Action Buttons */}
-                <Animated.View
-                    style={styles.actionButtonsContainer}
-                    entering={FadeInUp.delay(100).duration(400).springify()}
-                >
-                    <Animated.View style={createLinkStyle}>
-                        <TouchableOpacity
-                            style={styles.actionButtonLeft}
-                            onPressIn={handleCreateLinkPressIn}
-                            onPressOut={handleCreateLinkPressOut}
-                            activeOpacity={1}
-                        >
-                            <Link color="#FFF" size={24} style={{ marginBottom: 8 }} />
-                            <Text style={styles.actionButtonText}>Create Link</Text>
-                        </TouchableOpacity>
-                    </Animated.View>
+                <View style={styles.actionButtonsContainer}>
+                    <TouchableOpacity style={styles.actionButtonLeft} activeOpacity={0.7}>
+                        <Link color="#FFF" size={24} style={{ marginBottom: 8 }} />
+                        <Text style={styles.actionButtonText}>Create Link</Text>
+                    </TouchableOpacity>
 
-                    <Animated.View style={newAgentStyle}>
-                        <TouchableOpacity
-                            style={styles.actionButtonRight}
-                            onPress={handleNewAgentPress}
-                            onPressIn={handleNewAgentPressIn}
-                            onPressOut={handleNewAgentPressOut}
-                            activeOpacity={1}
-                        >
-                            <Video color="#FFF" size={24} fill="#FFF" style={{ marginBottom: 8 }} />
-                            <Text style={styles.actionButtonText}>New Agent</Text>
-                        </TouchableOpacity>
-                    </Animated.View>
-                </Animated.View>
+                    <TouchableOpacity
+                        style={styles.actionButtonRight}
+                        onPress={handleNewAgentPress}
+                        activeOpacity={0.7}
+                    >
+                        <Video color="#FFF" size={24} fill="#FFF" style={{ marginBottom: 8 }} />
+                        <Text style={styles.actionButtonText}>New Agent</Text>
+                    </TouchableOpacity>
+                </View>
 
                 {/* Call History List */}
-                {(() => {
-                    let globalIndex = 0;
-                    return Array.from(groupedHistory.entries()).map(([dateKey, items], groupIndex) => (
-                        <Animated.View
-                            key={dateKey}
-                            entering={FadeInUp.delay(groupIndex * 50).duration(250)}
-                        >
-                            {/* Section Header */}
-                            <Animated.Text
-                                style={styles.sectionHeader}
-                                entering={FadeIn.delay(groupIndex * 50 + 100).duration(200)}
-                            >
-                                {dateKey}
-                            </Animated.Text>
+                {Array.from(groupedHistory.entries()).map(([dateKey, items]) => (
+                    <View key={dateKey}>
+                        {/* Section Header */}
+                        <View style={styles.sectionHeaderContainer}>
+                            <Text style={styles.sectionHeader}>{dateKey}</Text>
+                        </View>
 
-                            {/* History Items */}
-                            {items.map((item, index) => {
-                                const currentGlobalIndex = globalIndex++;
-                                return (
-                                    <AnimatedCallRow
-                                        key={item.id}
-                                        item={item}
-                                        index={index}
-                                        globalIndex={currentGlobalIndex}
-                                        isEditMode={isEditMode}
-                                        onRedial={handleRedial}
-                                        onDelete={handleDelete}
-                                        onViewGapWords={handleViewGapWords}
-                                        isLast={index === items.length - 1}
-                                    />
-                                );
-                            })}
+                        {/* History Items */}
+                        {items.map((item, index) => (
+                            <CallRow
+                                key={item.id}
+                                item={item}
+                                isEditMode={isEditMode}
+                                onRedial={handleRedial}
+                                onDelete={handleDelete}
+                                onViewGapWords={handleViewGapWords}
+                                isLast={index === items.length - 1}
+                            />
+                        ))}
 
-                            {/* Bottom separator after group */}
-                            <View style={styles.groupSeparator} />
-                        </Animated.View>
-                    ));
-                })()}
+                        {/* Bottom separator after group */}
+                        <View style={styles.groupSeparator} />
+                    </View>
+                ))}
 
                 {/* Empty State */}
                 {history.length === 0 && (
-                    <Animated.View
-                        style={styles.emptyState}
-                        entering={FadeInUp.delay(200).duration(500).springify()}
-                    >
+                    <View style={styles.emptyState}>
                         <Video size={48} color={THEME.colors.textSecondary} style={{ marginBottom: 16 }} />
                         <Text style={styles.emptyStateTitle}>No Recent Sessions</Text>
                         <Text style={styles.emptyStateSubtitle}>
                             Tap "New Agent" to create your first language tutor
                         </Text>
-                    </Animated.View>
+                    </View>
                 )}
-            </ScrollView >
+            </ScrollView>
 
             {/* New Agent Sheet */}
-            < NewAgentSheet
+            <NewAgentSheet
                 isVisible={isNewAgentSheetVisible}
                 onClose={() => setIsNewAgentSheetVisible(false)}
                 onStartSession={handleStartSession}
             />
-        </View >
+        </View>
     );
 };
 
@@ -608,6 +390,7 @@ const styles = StyleSheet.create({
     },
     pageTitle: {
         ...THEME.typography.largeTitle,
+        fontSize: 32,
         color: THEME.colors.textPrimary,
         marginBottom: 20,
     },
@@ -637,21 +420,22 @@ const styles = StyleSheet.create({
         fontWeight: '600',
         color: '#FFF',
     },
+    sectionHeaderContainer: {
+        marginBottom: 10,
+        marginLeft: 4,
+    },
     sectionHeader: {
         ...THEME.typography.footnote,
         fontWeight: '600',
         color: THEME.colors.textSecondary,
-        marginBottom: 8,
-        marginLeft: 4,
         textTransform: 'uppercase',
         letterSpacing: 0.5,
     },
     callItem: {
         flexDirection: 'row',
         alignItems: 'center',
-        backgroundColor: THEME.colors.surfaceHighlight,
-        borderRadius: THEME.borderRadius.md,
-        padding: 12,
+        paddingVertical: 10,
+        paddingHorizontal: 4,
     },
     avatarContainer: {
         marginRight: 12,
@@ -697,39 +481,13 @@ const styles = StyleSheet.create({
         width: 36,
         height: 36,
         borderRadius: 18,
-        backgroundColor: 'rgba(142, 142, 147, 0.15)',
         alignItems: 'center',
         justifyContent: 'center',
-        overflow: 'hidden',
-    },
-    infoButtonInner: {
-        width: '100%',
-        height: '100%',
-        alignItems: 'center',
-        justifyContent: 'center',
-    },
-    deleteButton: {
-        alignItems: 'center',
-        justifyContent: 'center',
-    },
-    deleteButtonContainer: {
-        position: 'absolute',
-        left: 0,
-        top: 0,
-        bottom: 0,
-        justifyContent: 'center',
-        zIndex: 1,
-    },
-    rowContent: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        flex: 1,
     },
     separator: {
         height: StyleSheet.hairlineWidth,
-        backgroundColor: '#38383A',
+        backgroundColor: 'rgba(255, 255, 255, 0.15)',
         marginLeft: 64,
-        marginVertical: 4,
     },
     groupSeparator: {
         height: 20,
