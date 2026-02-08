@@ -116,6 +116,8 @@ All communication uses **WebSocket JSON messages**. Audio is embedded as Base64-
 | `response.audio.delta` | AI audio chunk |
 | `input_audio_buffer.speech_started` | VAD: user started speaking |
 | `input_audio_buffer.speech_stopped` | VAD: user stopped speaking |
+| `response.audio_transcript.delta` | AI transcript chunk (streaming) |
+| `response.created` | New response starting |
 | `response.function_call_arguments.done` | Tool call completed |
 | `gap_word.logged` | Custom: vocabulary gap recorded |
 
@@ -261,17 +263,16 @@ App (root)
             |
             +-- Viewfinder (Layer 1: camera background)
             |
-            +-- FlashOverlay (Layer 2: capture flash)
-            |
-            +-- UI Layer (Layer 3: call UI)
+            +-- UI Layer (Layer 2: call UI)
             |    |
             |    +-- StatusPill (top: connection status)
             |    +-- ActiveOrb (center: viewfinder crosshair)
+            |    +-- AI Transcript (subtitle bubble, between orb and controls)
             |    +-- ControlSheet (bottom: controls)
             |
-            +-- CallHistoryScreen (Layer 4: home screen)
+            +-- CallHistoryScreen (Layer 3: home screen)
             |
-            +-- GapWordsScreen (Layer 5: vocabulary review)
+            +-- GapWordsScreen (Layer 4: vocabulary review)
 ```
 
 ### 4.2 State Machine
@@ -332,7 +333,9 @@ disconnect() {
   6. Reset barge-in tracking (consecutiveAbove = 0)
 }
 ```
+> **Transcript reset:** On each new `connect()`, the AI transcript state and subtitle queue are cleared so no stale text from a previous call lingers on screen.
 
+> **Android Speaker Routing:**
 > **Android Speaker Routing:** `InCallManager.start({ media: 'audio' })` routes audio to the **earpiece** by default on Android. Without `setSpeakerphoneOn(true)`, the user hears nothing from the speaker. This is a critical one-liner that's easy to miss.
 
 ### 4.4 The Ref Pattern (Avoiding Stale Closures)
@@ -531,7 +534,38 @@ if (rms > threshold) {
 - Human speech at arm's length: 0.015–0.11
 - Barge-in threshold (at 0.003 ambient): max(0.003 * 3, 0.02) = 0.02
 
-### 5.6 RMS Calculation (Optimized)
+### 5.6 Live AI Transcript (Timed Subtitles)
+
+The app displays a subtitle overlay of what the AI is currently saying, synced to sentence timing.
+
+**Data flow:**
+
+```
+OpenAI -> response.audio_transcript.delta { delta: "Bonjour" }
+    |
+    v
+aiTranscript state (full accumulated text)
+    |
+    v
+useEffect: scan for sentence boundaries ([.!?] + whitespace)
+    |
+    +-- Completed sentence found -> push to subtitle queue with timed duration
+    +-- No boundary yet -> live-stream the in-progress text as a "tail"
+    |
+    v
+displaySubtitle state (what the user sees)
+```
+
+**Timed queue system:** Each completed sentence gets a display duration of `min(4000, max(1200, charCount * 60))` ms. A `setTimeout` chain cycles through the queue so each sentence stays on screen proportional to its length. Between timed sentences, the in-progress (unfinished) text streams live.
+
+**Clearing:**
+- `response.created` — Clears transcript + queue + timer at the very start of a new response (before any audio or transcript deltas arrive, preventing the race condition where transcript deltas arrive before the first `response.audio.delta`)
+- `input_audio_buffer.speech_started` — Clears immediately on barge-in
+- `connect()` — Clears on new call to prevent stale text from a previous session
+
+**UI:** Semi-transparent bubble below the orb, max 3 lines, white text on rgba(0,0,0,0.6) background. Positioned in normal layout flow (not absolute) to avoid overlapping the orb or controls.
+
+### 5.7 RMS Calculation (Optimized)
 
 ```typescript
 const calculateRMS = (base64Data: string): number => {
@@ -577,7 +611,6 @@ useAnimatedReaction (UI thread, zero re-renders)
 captureAndSendFrame()
     |
     +-- Guard checks (cooldown, concurrent capture, AI speaking, refs)
-    +-- Trigger flash animation (runOnUI)
     +-- Set mode to 'processing'
     +-- takePictureAsync (0.7 quality for crop headroom)
     +-- Calculate crop region (center of screen, matching crosshair box)
@@ -929,7 +962,7 @@ The app uses four categories of state, each with a specific purpose:
 | Category | Mechanism | Thread | Re-renders? | Use Case |
 |----------|-----------|--------|-------------|----------|
 | UI State | `useState` | JS | Yes | `isConnected`, `interactionMode`, `isMuted` |
-| Animation State | `useSharedValue` | UI | No | `volumeLevel`, `flashOpacity`, `stabilityProgress` |
+|| Animation State | `useSharedValue` | UI | No | `volumeLevel`, `stabilityProgress` |
 | Callback State | `useRef` | JS | No | `isMutedRef`, `interactionModeRef`, `wsRef` |
 | Persistent State | AsyncStorage | Disk | No (until loaded) | `callHistory`, `agents`, `gapWords` |
 
@@ -968,10 +1001,9 @@ The app uses four categories of state, each with a specific purpose:
 The app uses **animated layer switching** instead of a navigation library:
 
 ```
-Layer 4 (z:20): CallHistoryScreen  -- slides DOWN when call starts
-Layer 5 (z:25): GapWordsScreen     -- slides in from RIGHT
-Layer 3 (z:10): Call UI            -- fades IN when connected
-Layer 2 (z:5):  Flash Overlay      -- pulses on capture
+Layer 3 (z:20): CallHistoryScreen  -- slides DOWN when call starts
+Layer 4 (z:25): GapWordsScreen     -- slides in from RIGHT
+Layer 2 (z:10): Call UI            -- fades IN when connected
 Layer 1 (z:0):  Viewfinder         -- always active
 ```
 
@@ -1116,7 +1148,6 @@ Current state: **ws:// (cleartext)**. This is acceptable for the prototype but m
 | `BARGE_IN_CONSECUTIVE_FRAMES` | 3 | App.tsx | ~120ms confirmation window |
 | `CALIBRATION_SAMPLES` | 25 | App.tsx | ~1s ambient noise calibration |
 | `VISION_COOLDOWN_MS` | 8,000 ms | App.tsx | Minimum time between captures |
-| `FLASH_DURATION_MS` | 150 ms | App.tsx | Capture flash animation |
 | `CROSSHAIR_SIZE` | 280 px | App.tsx | Viewfinder box size |
 | `ORB_SIZE` | 280 px | ActiveOrb.tsx | Must match CROSSHAIR_SIZE |
 | `CORNER_RADIUS` | 40 px | ActiveOrb.tsx | Rounded square corners |
@@ -1203,7 +1234,6 @@ Time  Client                           Relay                OpenAI
 Time  Client              Relay                OpenAI
  |
  |    [Device stable for 1.2s]
- |    [Flash animation]
  |    [Mode: processing]
  |    [Capture photo]
  |    [Crop + compress]
