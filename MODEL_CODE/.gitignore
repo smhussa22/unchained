@@ -1,0 +1,29 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+*.egg-info/
+dist/
+build/
+.ipynb_checkpoints/
+.jupyter/
+
+# Large / binary data (regenerate or download separately)
+data/*.npz
+data/*.pt
+
+# Local scratch
+Untitled.ipynb
+DATAQUEST_executed.ipynb
+
+# OS / tooling
+.DS_Store
+Thumbs.db
+*.log
+.coverage
+htmlcov/
+coverage.xml
+
+# Legacy / optional (not used by current pipeline)
+synthetic_medical_supply_data.json
