@@ -1,0 +1,25 @@
+@import url("https://fonts.googleapis.com/css2?family=Google+Sans+Flex:opsz,wght@6..144,100..1000&display=swap");
+@import "tailwindcss";
+
+@theme {
+  --font-main: "Google Sans Flex", ui-sans-serif, system-ui, sans-serif;
+  --color-mainwhite: #ffffff;
+  --color-mainblack: #0a0a0a;
+}
+
+@layer utilities {
+  .font-main {
+    font-family: var(--font-main);
+  }
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: var(--font-main);
+  background-color: var(--color-mainblack);
+  color: var(--color-mainwhite);
+  overflow: hidden;
+}
